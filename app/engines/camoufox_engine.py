@@ -5,10 +5,27 @@ calls through a single-worker executor (see app/main.py).
 """
 from __future__ import annotations
 
+import os
 import time
 import urllib.parse
 
 from .base import BaseEngine, Session, looks_like_challenge
+
+# Firefox single-process mode (MOZ_FORCE_DISABLE_E10S) makes Playwright's new_page()
+# hang forever (verified: launch + new_context fine, new_page never returns). Keep
+# multi-process mode and trim it to one content process instead to save RAM.
+_DROP_ENV = ("MOZ_FORCE_DISABLE_E10S",)
+_LEAN_PREFS = {
+    "dom.ipc.processCount": 1,
+    "dom.ipc.processCount.webIsolated": 1,
+    "dom.ipc.processPrelaunch.enabled": False,  # no spare pre-launched content process
+    "fission.autostart": False,
+    "network.process.enabled": False,  # socket/RDD/utility work folded into the parent
+    "media.rdd-process.enabled": False,
+    "media.utility-process.enabled": False,
+    "browser.sessionhistory.max_total_viewers": 0,
+    "browser.cache.memory.capacity": 16384,
+}
 
 
 class CamoufoxEngine(BaseEngine):
@@ -22,12 +39,22 @@ class CamoufoxEngine(BaseEngine):
         self._pw = None
         self._ctx = None
         self._page = None
+        self.phase = "idle"  # launch -> new_context -> new_page -> goto -> challenge -> done
+        self.phase_since = time.time()
+
+    def _set_phase(self, phase: str) -> None:
+        self.phase, self.phase_since = phase, time.time()
 
     def _ensure(self):
         if self._page is not None:
             return self._page
         from camoufox.sync_api import Camoufox
-        kwargs = {"headless": self.headless}
+        kwargs = {"headless": self.headless,
+                  "env": {k: v for k, v in os.environ.items() if k not in _DROP_ENV}}
+        if os.getenv("MKV_LEAN_BROWSER", "true").lower() in ("1", "true", "yes"):
+            from camoufox import DefaultAddons
+            kwargs["firefox_user_prefs"] = dict(_LEAN_PREFS)
+            kwargs["exclude_addons"] = [DefaultAddons.UBO]  # ad blocker not needed to pass CF
         if self.humanize:
             kwargs["humanize"] = True
         if self.proxy:
@@ -36,9 +63,12 @@ class CamoufoxEngine(BaseEngine):
                                "username": urllib.parse.unquote(p.username or ""),
                                "password": urllib.parse.unquote(p.password or "")}
             kwargs["geoip"] = True  # timezone/locale follow the proxy IP, not the host
+        self._set_phase("launch")
         self._cm = Camoufox(**kwargs)
         self._pw = self._cm.__enter__()
+        self._set_phase("new_context")
         self._ctx = self._pw.new_context()
+        self._set_phase("new_page")
         self._page = self._ctx.new_page()
         return self._page
 
@@ -86,8 +116,11 @@ class CamoufoxEngine(BaseEngine):
 
     def get_session(self, url: str, timeout_s: int = 90) -> Session:
         page = self._ensure()
+        self._set_phase("goto")
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
+        self._set_phase("challenge")
         self._wait_through_challenge(timeout_s, want_json=False)
+        self._set_phase("done")
         return Session(cookies=self._cookies(), user_agent=page.evaluate("navigator.userAgent"))
 
     def fetch(self, url: str, timeout_s: int = 90) -> tuple[str, Session]:
@@ -139,3 +172,4 @@ class CamoufoxEngine(BaseEngine):
         except Exception:
             pass
         self._cm = self._pw = self._ctx = self._page = None
+        self._set_phase("closed")

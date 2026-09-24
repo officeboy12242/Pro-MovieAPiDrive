@@ -13,6 +13,7 @@ the session alive over plain HTTP and closes the browser (see client.py).
 from __future__ import annotations
 
 import os
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +27,8 @@ from .engines import make_engine
 from .keepalive import start_keepalive
 from .store import Store
 
-app = FastAPI(title="mkvbase-cf-api", version="1.3.0")
+app = FastAPI(title="mkvbase-cf-api", version="1.3.1")
+_BOOT = time.time()
 start_keepalive()
 
 # Ingest key for split-plane sync (POST /sync). Required only when MKV_SYNC_KEY is set.
@@ -36,6 +38,9 @@ _SERVE_ONLY = os.getenv("MKV_SERVE_ONLY", "").lower() in ("1", "true", "yes")
 _DATA_DIR = os.getenv("MKV_DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
 # Longest a request waits for the warmer before answering from stale data or 503.
 _REQUEST_WAIT_S = float(os.getenv("MKV_REQUEST_WAIT", "25"))
+# Hard ceiling on one warm attempt. Past it the browser is killed and the engine
+# thread replaced, so a wedged browser can never block the warmer forever.
+_WARM_TIMEOUT_S = float(os.getenv("MKV_WARM_TIMEOUT", "300"))
 
 _client: MkvbaseClient | None = None
 _client_lock = threading.Lock()
@@ -70,6 +75,52 @@ def _cache_put(term: str, obj: dict) -> None:
 
 def _run_on_engine(fn, *args, timeout: float | None = None, **kwargs):
     return _engine_pool.submit(fn, *args, **kwargs).result(timeout=timeout)
+
+
+def _kill_browser_procs() -> int:
+    """SIGKILL every descendant of this server (Playwright driver + Firefox).
+    Linux /proc only; returns how many were killed (0 elsewhere)."""
+    children: dict[int, list[int]] = {}
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except FileNotFoundError:
+        return 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            children.setdefault(ppid, []).append(pid)
+        except Exception:
+            continue
+    todo, killed = list(children.get(os.getpid(), [])), 0
+    while todo:
+        pid = todo.pop()
+        todo += children.get(pid, [])
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def _reset_engine() -> int:
+    """Abandon a wedged engine thread: kill its browser, start a fresh executor and
+    engine (the old Playwright objects belong to the stuck thread)."""
+    global _engine_pool
+    killed = _kill_browser_procs()
+    old, _engine_pool = _engine_pool, ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine")
+    old.shutdown(wait=False, cancel_futures=True)
+    if _client is not None:
+        _client._engine = make_engine()
+    return killed
+
+
+def _browser_phase() -> tuple[str, float] | None:
+    eng = _client._engine if _client else None
+    if eng is None or not hasattr(eng, "phase"):
+        return None
+    return eng.phase, time.time() - eng.phase_since
 
 
 def _get_client() -> MkvbaseClient:
@@ -136,20 +187,28 @@ class Warmer:
         self._started = time.time()
         self.attempts += 1
         try:
-            _run_on_engine(client.ensure_session)
+            _run_on_engine(client.ensure_session, timeout=_WARM_TIMEOUT_S)
             self.state, self.fails, self.last_error = "ready", 0, None
             self.last_ok = time.time()
             self._ready.set()
             print(f"[warmer] session ready in {time.time() - self._started:.1f}s "
                   f"(plain HTTP {'ok' if client.http_verified else 'blocked, browser mode'})", flush=True)
+        except FutureTimeout:
+            phase = _browser_phase()
+            killed = _reset_engine()
+            self._failed(f"warm attempt exceeded {_WARM_TIMEOUT_S:.0f}s, stuck at browser phase "
+                         f"'{phase[0] if phase else '?'}'; killed {killed} browser processes")
         except Exception as e:
-            self.fails += 1
-            self.state = "failed"
-            self.last_error = f"{type(e).__name__}: {e}"[:400]
-            self.next_retry_at = time.time() + min(600, 30 * 2 ** (self.fails - 1))
-            print(f"[warmer] attempt {self.attempts} failed: {self.last_error}", flush=True)
+            self._failed(f"{type(e).__name__}: {e}")
         finally:
             self.last_took_s = round(time.time() - self._started, 1)
+
+    def _failed(self, error: str) -> None:
+        self.fails += 1
+        self.state = "failed"
+        self.last_error = error[:400]
+        self.next_retry_at = time.time() + min(600, 30 * 2 ** (self.fails - 1))
+        print(f"[warmer] attempt {self.attempts} failed: {self.last_error}", flush=True)
 
     def retry_after_s(self) -> int:
         now = time.time()
@@ -160,7 +219,9 @@ class Warmer:
         return 5
 
     def status(self) -> dict:
+        phase = _browser_phase()
         return {"state": self.state, "attempts": self.attempts, "last_error": self.last_error,
+                "browser_phase": f"{phase[0]} ({phase[1]:.0f}s)" if phase else None,
                 "last_ok_ago_s": round(time.time() - self.last_ok) if self.last_ok else None,
                 "last_took_s": self.last_took_s, "retry_after_s": self.retry_after_s(),
                 "plain_http_ok": self.http_ok}
@@ -240,7 +301,7 @@ def health():
                 "mkv_session": _client._session.has_mkv_session(),
                 "cf_clearance": bool(_client._session.cookies.get("cf_clearance")),
                 "challenge_ttl_s": round(_client.challenge_ttl_s())}
-    return {"ok": True, "engine": os.getenv("MKV_ENGINE", "auto"),
+    return {"ok": True, "uptime_s": round(time.time() - _BOOT), "engine": os.getenv("MKV_ENGINE", "auto"),
             "client_engine": _client.engine_name if _client else "not-init",
             "session": sess,
             "warmer": _warmer.status(),

@@ -1,6 +1,6 @@
 # Render Blueprint — free plan variant
-# NOTE: free plan = 512MB RAM. Camoufox is memory-tuned via
-# MOZ_FORCE_DISABLE_E10S (single-process Firefox) + MALLOC_ARENA_MAX=2, and the
+# NOTE: free plan = 512MB RAM, 0.1 CPU. Camoufox is memory-tuned with Firefox prefs
+# (one content process, no fission; MKV_LEAN_BROWSER) + MALLOC_ARENA_MAX=2, and the
 # browser is closed right after Cloudflare clears (MKV_RELEASE_BROWSER): searches
 # then run over plain HTTP, so RAM stays low between clearances.
 # Keepalive is ON: it pings the public URL so the instance (and its warm session)
@@ -25,12 +25,14 @@ services:
         value: "true"       # close Firefox once plain HTTP is verified
       - key: MKV_REQUEST_WAIT
         value: "25"         # max seconds a request waits for the warmer, then 503/stale
+      - key: MKV_BOOTSTRAP_TIMEOUT
+        value: "150"        # 0.1 CPU: page load + challenge are slow, give them room
+      - key: MKV_WARM_TIMEOUT
+        value: "420"        # hard ceiling per warm attempt, then kill browser + retry
       - key: MKV_CACHE_TTL
         value: "300"        # repeat searches within 5 min are served instantly
       - key: MKV_DATA_DIR
         value: /tmp/data
-      - key: MOZ_FORCE_DISABLE_E10S
-        value: "1"
       - key: MALLOC_ARENA_MAX
         value: "2"
       # Optional: residential proxy, only if /health shows Cloudflare never clears
