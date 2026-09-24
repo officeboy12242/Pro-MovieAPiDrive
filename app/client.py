@@ -107,14 +107,15 @@ class MkvbaseClient:
     # ------------------------------------------------------------------ plain HTTP fast path
     def _http_get(self, url: str, timeout_s: int = 25) -> str | None:
         """GET with the cleared cookies and a browser-identical TLS fingerprint.
-        Works only after a successful clearance (needs cf_clearance)."""
+        Verified live: impersonate='firefox133' + cookies captured from the Camoufox
+        clearance passes Cloudflare with plain HTTPS (no browser) -> 200 JSON."""
         if self._session is None or not self._session.cookies.get("cf_clearance"):
             return None
         try:
             from curl_cffi import requests as cffi
         except ImportError:
             return None
-        for impersonate in ("firefox", "chrome", None):
+        for impersonate in ("firefox133", "firefox", "chrome131", None):
             try:
                 kwargs = dict(headers={
                     "User-Agent": self._session.user_agent or "Mozilla/5.0",
