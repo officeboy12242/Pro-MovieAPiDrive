@@ -281,6 +281,30 @@ def _unavailable(kind: str, term: str, err: Exception) -> tuple[dict, float]:
     raise HTTPException(status_code=500, detail=f"{type(err).__name__}: {err}")
 
 
+def _cgroup() -> dict:
+    """Memory ceiling and OOM-kill count of this container (cgroup v2, then v1)."""
+    out: dict = {}
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(p) as f:
+                v = f.read().strip()
+            out["mem_max_mb"] = None if v == "max" else round(int(v) / 2 ** 20)
+            break
+        except Exception:
+            continue
+    for p in ("/sys/fs/cgroup/memory.events", "/sys/fs/cgroup/memory/memory.oom_control"):
+        try:
+            with open(p) as f:
+                for line in f:
+                    k, _, v = line.partition(" ")
+                    if k == "oom_kill":
+                        out["oom_kills"] = int(v)
+            break
+        except Exception:
+            continue
+    return out
+
+
 def _mem_mb() -> float | None:
     """Container memory in use (cgroup v2, then v1). None when not in a container."""
     for p in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
@@ -307,6 +331,7 @@ def health():
             "warmer": _warmer.status(),
             "browser_open": _client.browser_open if _client else False,
             "mem_mb": _mem_mb(),
+            **_cgroup(),
             "proxy": bool(os.getenv("MKV_PROXY")),
             "serve_only": _SERVE_ONLY,
             "bootstrap_timeout_s": _client._bootstrap_timeout if _client else None,
