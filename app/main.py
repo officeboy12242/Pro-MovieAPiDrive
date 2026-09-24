@@ -333,6 +333,7 @@ def health():
             "mem_mb": _mem_mb(),
             **_cgroup(),
             "proxy": bool(os.getenv("MKV_PROXY")),
+            "origin_key": bool(os.getenv("MKV_ORIGIN_KEY")),
             "serve_only": _SERVE_ONLY,
             "bootstrap_timeout_s": _client._bootstrap_timeout if _client else None,
             "cache": {"entries": len(_cache), "hits": _cache_hits, "misses": _cache_misses,

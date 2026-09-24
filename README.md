@@ -61,6 +61,27 @@ plain HTTPS with a Firefox TLS fingerprint (curl_cffi). mkvbase re-issues its
 without a browser, so the browser is closed right after clearance and only
 relaunched when Cloudflare's `cf_clearance` itself expires.
 
+## Owner allowlist: no browser at all (recommended for Render free)
+
+Solving the Cloudflare challenge in a browser needs ~1.9GB RAM, which a 512MB
+host cannot provide. As the site owner, let your own server through instead:
+
+1. Generate a secret locally: `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+   Keep it out of git and chat.
+2. Cloudflare dashboard -> Security -> WAF -> Custom rules -> Create rule, placed first:
+   - Expression: `(starts_with(http.request.uri.path, "/api/links") and any(http.request.headers["x-mkv-key"][*] eq "<secret>"))`
+   - Action: **Skip**: all remaining custom rules, and under *More components to skip*:
+     Security Level, Browser Integrity Check (plus Super Bot Fight Mode rules on Pro+).
+3. Check Security -> Events for which service issued the challenge. If it is
+   **Bot Fight Mode** (Free plan), it cannot be skipped per request: turn it off and
+   use a custom rule to challenge everything except requests with the header.
+4. Render dashboard -> Environment: set `MKV_ORIGIN_KEY=<secret>`
+   (header name via `MKV_ORIGIN_HEADER`, default `X-Mkv-Key`).
+
+With the key set, the warmer bootstraps the session from bare `/api/links` over
+plain HTTP; `/health` shows `origin_key: true` and `plain_http_ok: true`, and no
+browser is launched.
+
 ## Deploy notes (server / Render)
 
 - `render.yaml` is the source of truth. Key settings: `MKV_ENGINE=camoufox`,

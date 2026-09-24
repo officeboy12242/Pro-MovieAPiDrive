@@ -14,6 +14,10 @@ Session lifecycle:
     browser is only needed again when Cloudflare's cf_clearance itself dies (403).
   - After a clearance whose plain-HTTP path is verified, the browser is closed
     (MKV_RELEASE_BROWSER, default on) so a 512MB host is not holding Firefox in RAM.
+
+Owner allowlist (MKV_ORIGIN_KEY): the site owner adds a Cloudflare rule that skips
+the challenge for requests carrying this secret header. Every request then sends
+it, and a session is bootstrapped from bare /api/links over plain HTTP: no browser.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ from .protocol import build_search_url
 
 BASE = "https://mkvbase.site"
 _IMPERSONATE = ("firefox133", "firefox", "chrome131", None)
+_DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
 
 
 class MkvbaseError(RuntimeError):
@@ -49,6 +54,8 @@ class MkvbaseClient:
         self._impersonate: str | None = None  # sticky winner once one passes
         self._bootstrap_timeout = int(os.getenv("MKV_BOOTSTRAP_TIMEOUT", "90"))
         self._proxy = os.getenv("MKV_PROXY") or None  # cf_clearance is IP-bound: browser + HTTP share it
+        self._origin_key = os.getenv("MKV_ORIGIN_KEY") or None  # owner's Cloudflare skip-rule secret
+        self._origin_header = os.getenv("MKV_ORIGIN_HEADER", "X-Mkv-Key")
         self._release_browser = os.getenv("MKV_RELEASE_BROWSER", "true").lower() in ("1", "true", "yes")
         self.http_verified: bool | None = None  # did plain HTTP pass after the last clearance?
         self._load_persisted_session()
@@ -120,7 +127,7 @@ class MkvbaseClient:
     def session_ready(self) -> bool:
         with self._lock:
             s = self._session
-            return bool(s and s.has_mkv_session() and s.cookies.get("cf_clearance")
+            return bool(s and s.has_mkv_session() and (self._origin_key or s.cookies.get("cf_clearance"))
                         and not self._challenge_expired())
 
     def _absorb(self, s: Session, cookies) -> None:
@@ -153,7 +160,7 @@ class MkvbaseClient:
         """Engine thread only. Make the session usable, cheapest way first:
         already valid -> renew mkv_* over plain HTTP -> browser clearance.
         Returns whether the plain-HTTP path works (False = only the browser does)."""
-        if self.session_ready() or self._renew_http():
+        if self.session_ready() or self._renew_http() or self._bootstrap_http():
             self.http_verified = True
             return True
         try:
@@ -166,6 +173,24 @@ class MkvbaseClient:
         if self.http_verified and self._release_browser:
             self.release_browser()
         return self.http_verified
+
+    def _bootstrap_http(self) -> bool:
+        """With the owner's skip-rule header, bare /api/links issues mkv_* cookies
+        over plain HTTP, so no browser clearance is needed at all."""
+        if not self._origin_key:
+            return False
+        s = Session(cookies={}, user_agent=_DEFAULT_UA)
+        with self._lock:
+            self._session = s
+        try:
+            self._http_request(f"{self.base}/api/links", timeout_s=20)
+        except MkvbaseError:
+            self._drop_session(s)
+            return False
+        if not self.session_ready():
+            self._drop_session(s)
+            return False
+        return True
 
     def _renew_http(self) -> bool:
         """Bare /api/links re-issues every mkv_* cookie. Absorbing them resets the
@@ -183,7 +208,7 @@ class MkvbaseClient:
         clearance passes Cloudflare with plain HTTPS (no browser) -> 200 JSON."""
         with self._lock:
             s = self._session
-            if s is None or not s.cookies.get("cf_clearance"):
+            if s is None or not (self._origin_key or s.cookies.get("cf_clearance")):
                 raise NeedsSession("no Cloudflare clearance yet")
             cookies, ua = dict(s.cookies), s.user_agent
         try:
@@ -200,6 +225,7 @@ class MkvbaseClient:
                 "X-Requested-With": "XMLHttpRequest",
                 "Accept": "*/*",
                 "Referer": f"{self.base}/",
+                **({self._origin_header: self._origin_key} if self._origin_key else {}),
             }, cookies=cookies, timeout=timeout_s)
             if impersonate:
                 kwargs["impersonate"] = impersonate
@@ -217,7 +243,7 @@ class MkvbaseClient:
             if r.status_code == 403:
                 blocked += 1
             last = f"HTTP {r.status_code}"
-        if blocked == len(order):  # every fingerprint refused: clearance is dead
+        if blocked == len(order):  # every fingerprint refused: clearance dead (or skip rule not matching)
             self._drop_session(s)
             raise NeedsSession("Cloudflare clearance expired (403)")
         raise MkvbaseError(f"plain-HTTP fetch failed: {last}")
