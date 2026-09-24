@@ -1,24 +1,13 @@
 """Camoufox engine — Firefox fork with humanized fingerprints (anti-detect).
 
-Camoufox is a patched Firefox designed to defeat fingerprinting; its Python API
-(camoufox.sync_api / Camoufox) launches it with a realistic fingerprint. The
-managed challenge usually auto-clears on plain page.goto; when it doesn't,
-click_in_page can click the Turnstile widget as a fallback.
-
-NOTE: sync Playwright objects are bound to their creating thread. The FastAPI
-layer must route all engine calls through a single-worker executor (see main.py).
+Sync Playwright objects are thread-affine; the FastAPI layer routes all engine
+calls through a single-worker executor (see app/main.py).
 """
 from __future__ import annotations
 
 import time
 
-from .base import BaseEngine, Session
-
-
-def _looks_like_challenge(html: str) -> bool:
-    t = (html or "")[:1200].lower()
-    return ("just a moment" in t or "attention required" in t
-            or "performing security verification" in t or "challenge-platform" in t)
+from .base import BaseEngine, Session, looks_like_challenge
 
 
 class CamoufoxEngine(BaseEngine):
@@ -38,7 +27,7 @@ class CamoufoxEngine(BaseEngine):
         from camoufox.sync_api import Camoufox
         kwargs = {"headless": self.headless}
         if self.humanize:
-            kwargs["humanize"] = True  # human-like cursor/mouse behavior
+            kwargs["humanize"] = True
         self._cm = Camoufox(**kwargs)
         self._pw = self._cm.__enter__()
         self._ctx = self._pw.new_context()
@@ -48,34 +37,31 @@ class CamoufoxEngine(BaseEngine):
     def _cookies(self) -> dict[str, str]:
         return {c["name"]: c["value"] for c in self._ctx.cookies()}
 
-    def _wait_through_challenge(self, timeout_s: int, want_json: bool = True) -> str:
-        """Poll until real content renders. Handles the observed sequence:
-        'Just a moment...' -> Turnstile auto-solve (cf_clearance issued) ->
-        automatic reload -> target page (JSON starts with '{')."""
+    def _wait_through_challenge(self, timeout_s: int, want_json: bool = False) -> str:
+        """Poll for real content. Handles: challenge -> Turnstile auto-solve ->
+        reload -> target page. Optional response capture is armed separately."""
         page = self._ensure()
         deadline = time.time() + timeout_s
         reloaded = False
         html = ""
         while time.time() < deadline:
-            time.sleep(1.5)
+            time.sleep(0.3)
             try:
                 html = page.content()
             except Exception:
                 html = ""
-            if html.strip() and not _looks_like_challenge(html[:1200]):
+            if html.strip() and not looks_like_challenge(html[:1200]):
                 if not want_json or "{" in html[:300]:
                     return html
             cleared = any(c["name"] == "cf_clearance" for c in self._ctx.cookies())
             if cleared and not reloaded and time.time() + 4 < deadline:
-                # clearance landed but page hasn't re-rendered yet -> nudge one reload
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=30000)
                     reloaded = True
                     continue
                 except Exception:
                     pass
-            # last resort: try clicking the Turnstile checkbox after 20s of stuck
-            if _looks_like_challenge(html[:1200]) and timeout_s - (deadline - time.time()) > 20:
+            if looks_like_challenge(html[:1200]) and timeout_s - (deadline - time.time()) > 20:
                 self._click_turnstile()
         return html
 
@@ -101,6 +87,42 @@ class CamoufoxEngine(BaseEngine):
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
         html = self._wait_through_challenge(timeout_s, want_json=True)
         return html, Session(cookies=self._cookies(), user_agent=page.evaluate("navigator.userAgent"))
+
+    # ------------------------------------------------------------------ fast path
+    def _arm_capture(self):
+        """Install a JS hook capturing in-page fetch() responses (same-window XHR,
+        like mkvbase's own client). Runs on the engine thread only."""
+        self._page.evaluate(
+            "window.__mkv_resps = [];"
+            "if (!window.__mkv_hooked) {"
+            "  const of = window.fetch;"
+            "  window.fetch = function(...a) {"
+            "    return of.apply(this, a).then(r => {"
+            "      try { const cl = r.clone(); cl.text().then(t => window.__mkv_resps.push({u: r.url, b: t})); } catch (e) {}"
+            "      return r;"
+            "    });"
+            "  };"
+            "  window.__mkv_hooked = true;"
+            "}"
+        )
+
+    def _pop_capture(self) -> list:
+        try:
+            return self._page.evaluate("(() => { const r = window.__mkv_resps || []; window.__mkv_resps = []; return r; })()") or []
+        except Exception:
+            return []
+
+    def inpage_fetch(self, url: str, timeout_s: int = 30) -> str | None:
+        """In-page fetch from the cleared page with the XHR header the server
+        requires; returns the response body text or None."""
+        try:
+            page = self._ensure()
+            out = page.evaluate(
+                "u => fetch(u, {headers: {'X-Requested-With': 'XMLHttpRequest'},"
+                "credentials: 'include'}).then(r => r.text())", url)
+            return out if isinstance(out, str) and out.strip() else None
+        except Exception:
+            return None
 
     def close(self) -> None:
         try:

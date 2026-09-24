@@ -38,11 +38,26 @@ set MKV_ENGINE=drissionpage                      # or camoufox
 
 | Route | Purpose |
 |---|---|
-| `GET /health` | liveness + engine name |
-| `GET /search?term=predestination` | signed search, JSON rows (cached to `data/`) |
+| `GET /health` | liveness + engine + cache stats |
+| `GET /search?term=predestination` | signed search, JSON rows (TTL-cached 5 min) |
+| `GET /search?term=x&refresh=true` | force a live scrape, bypass cache |
 | `GET /recent` | latest 50 links posted site-wide |
 | `GET /saved` | list persisted result files |
 | `GET /saved/search_predestination.json` | fetch a persisted result set |
+| `POST /cache/clear` | drop all cached results |
+
+## Performance (measured)
+
+| Scenario | Latency |
+|---|---|
+| Cold start (engine + CF clearance, prewarmed at boot) | ~40-75s once |
+| Live search, warm session (in-page fetch, no navigation) | **0.5-1s** |
+| Cached term (within TTL) | **<5ms** |
+
+The fast path fetches the signed URL via in-page `fetch()` with the
+`X-Requested-With: XMLHttpRequest` header — the same call mkvbase's own client
+makes — so no page navigation happens after the initial Cloudflare clearance.
+Transient site flakes are absorbed by one automatic retry.
 
 ## Deploy notes (server / Render)
 

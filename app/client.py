@@ -1,23 +1,22 @@
 """MkvbaseClient — orchestrates engine + protocol to deliver search/recent results.
 
-Recipe (validated live):
-  1. engine.get_session(GET /api/links)      -> CF clears on top-level nav,
-                                                cookies mkv_client_key/challenge/seq set
-  2. protocol.build_search_url(...)          -> XOR + PoW + HMAC, all local
-  3. engine.fetch(signed_url)                -> JSON renders top-level
-  4. parse, cache, return
+Two fetch modes:
+  FAST  in-page fetch from the already-cleared page (mkvbase's own client does
+        exactly this; needs X-Requested-With header). ~0.3-0.8s per search.
+  SLOW  full top-level navigation to the signed URL (~2-5s, session stays warm).
 
-If the signed URL still hits the interstitial (rare), we settle back on bare
-/api/links once and immediately retry the signed URL (the settle-then-sign trick).
+Bootstrap: top-level GET /api/links clears CF and sets mkv_* cookies.
+Fallback:  settle-then-sign (re-clear, retry), then slow path, then re-bootstrap.
 """
 from __future__ import annotations
 
 import json
 import re
 import time
+import urllib.parse
 
 from .engines.base import BaseEngine
-from .protocol import build_search_url
+from .protocol import build_search_url, parse_challenge
 
 BASE = "https://mkvbase.site"
 
@@ -32,16 +31,27 @@ class MkvbaseClient:
         self.base = base
         self.cache_path = cache_path
         self._session = None
+        self._last_mode = "slow"
 
     # ------------------------------------------------------------------ core
     def _bootstrap(self, force: bool = False, timeout_s: int = 90):
         if self._session is not None and not force and self._session.has_mkv_session():
-            return self._session
+            if not self._challenge_expired():
+                return self._session
         self._session = self.engine.get_session(f"{self.base}/api/links", timeout_s=timeout_s)
         if not self._session.has_mkv_session():
             raise MkvbaseError(
                 f"no mkv_* cookies after clearance (got: {sorted(self._session.cookies)})")
         return self._session
+
+    def _challenge_expired(self) -> bool:
+        """mkv_challenge embeds an expiry_ms timestamp — re-bootstrap only when stale."""
+        try:
+            ch = urllib.parse.unquote(self._session.cookies.get("mkv_challenge", ""))
+            expiry_ms = int(ch.split(":")[2])
+            return time.time() * 1000 > expiry_ms - 30_000  # 30s safety margin
+        except Exception:
+            return True  # can't tell -> safest to refresh
 
     def _extract_json(self, text: str) -> dict | None:
         """Find the first JSON object with a 'results' key in page text."""
@@ -50,7 +60,6 @@ class MkvbaseClient:
         start = text.find("{")
         if start == -1:
             return None
-        # scan for a balanced JSON object containing "results"
         depth = 0
         for i in range(start, len(text)):
             if text[i] == "{":
@@ -67,16 +76,42 @@ class MkvbaseClient:
                         return obj
         return None
 
+    def _get_session_or_raise(self, timeout_s: int):
+        try:
+            return self._bootstrap(timeout_s=timeout_s)
+        except MkvbaseError:
+            raise
+        except Exception as e:
+            raise MkvbaseError(f"engine failure during bootstrap: {type(e).__name__}: {e}")
+
     def _fetch_json(self, url: str, timeout_s: int = 90) -> dict:
-        body, session = self.engine.fetch(url, timeout_s=timeout_s)
-        self._session = session
-        obj = self._extract_json(body)
-        if obj is None:
-            # settle-then-sign retry: re-clear on bare endpoint, then one more shot
+        # FAST path: in-page fetch, no navigation
+        try:
+            body = self.engine.inpage_fetch(url, timeout_s=min(timeout_s, 20))
+            obj = self._extract_json(body or "")
+            if obj is not None:
+                self._last_mode = "fast"
+                return obj
+        except Exception:
+            pass
+        self._last_mode = "slow"
+        # SLOW path: full navigation to the signed URL
+        try:
+            body, session = self.engine.fetch(url, timeout_s=timeout_s)
+            self._session = session
+            obj = self._extract_json(body)
+            if obj is not None:
+                return obj
+        except Exception:
+            obj = None
+        # settle-then-sign: re-clear on bare endpoint, then one more slow shot
+        try:
             self._bootstrap(force=True, timeout_s=timeout_s)
             body, session = self.engine.fetch(url, timeout_s=timeout_s)
             self._session = session
             obj = self._extract_json(body)
+        except Exception:
+            obj = None
         if obj is None:
             snippet = re.sub(r"\s+", " ", (body or ""))[:200]
             raise MkvbaseError(f"no JSON with 'results' in response: {snippet!r}")
@@ -84,11 +119,11 @@ class MkvbaseClient:
 
     # ------------------------------------------------------------------ API
     def recent(self, timeout_s: int = 90) -> dict:
-        self._bootstrap(timeout_s=timeout_s)
+        self._get_session_or_raise(timeout_s)
         return self._fetch_json(f"{self.base}/api/links", timeout_s=timeout_s)
 
     def search(self, term: str, ent: int = 10, timeout_s: int = 120) -> dict:
-        session = self._bootstrap(timeout_s=timeout_s)
+        session = self._get_session_or_raise(timeout_s)
         seq = session.cookies.get("mkv_seq", "1")
         key = session.cookies["mkv_client_key"]
         challenge = session.cookies["mkv_challenge"]
@@ -96,6 +131,7 @@ class MkvbaseClient:
         obj = self._fetch_json(url, timeout_s=timeout_s)
         obj["_term"] = term
         obj["_engine"] = self.engine.name
+        obj["_mode"] = "inpage" if self._last_mode == "fast" else "nav"
         obj["_scraped_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if self.cache_path:
             self._cache(obj, term)
@@ -111,4 +147,4 @@ class MkvbaseClient:
                       encoding="utf-8") as f:
                 json.dump(obj, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass  # cache is best-effort
+            pass

@@ -1,9 +1,12 @@
-# Render Blueprint — deploy with: Push this folder to GitHub -> Render -> New -> Blueprint
+# Render Blueprint — free plan variant
+# NOTE: free plan = 512MB RAM. Camoufox is memory-tuned via
+# MOZ_FORCE_DISABLE_E10S (single-process Firefox) + MALLOC_ARENA_MAX=2.
+# Keepalive is OFF on free: letting the instance sleep keeps RAM clean.
 services:
   - type: web
-    name: mkvbase-cf-api
+    name: pro-movieapidrive
     runtime: docker
-    plan: standard          # 2GB RAM — Camoufox needs ~600-800MB; Starter's 512MB will OOM
+    plan: free
     healthCheckPath: /health
     autoDeploy: true
     envVars:
@@ -12,8 +15,14 @@ services:
       - key: MKV_HEADLESS
         value: "true"
       - key: MKV_KEEPALIVE
-        value: "true"       # self-ping /health every 10 min to prevent cold-start sleep
-      - key: MKV_KEEPALIVE_MIN
-        value: "10"
+        value: "false"
+      - key: MKV_PREWARM
+        value: "true"       # clear CF at boot so the first search is fast
+      - key: MKV_CACHE_TTL
+        value: "300"        # repeat searches within 5 min are served instantly
       - key: MKV_DATA_DIR
-        value: /tmp/data    # ephemeral on Render; fine for cache/history
+        value: /tmp/data
+      - key: MOZ_FORCE_DISABLE_E10S
+        value: "1"
+      - key: MALLOC_ARENA_MAX
+        value: "2"
