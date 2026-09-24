@@ -1,0 +1,4 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+camoufox[geoip]>=0.4.0
+httpx>=0.27

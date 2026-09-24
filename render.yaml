@@ -1,0 +1,19 @@
+# Render Blueprint — deploy with: Push this folder to GitHub -> Render -> New -> Blueprint
+services:
+  - type: web
+    name: mkvbase-cf-api
+    runtime: docker
+    plan: standard          # 2GB RAM — Camoufox needs ~600-800MB; Starter's 512MB will OOM
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: MKV_ENGINE
+        value: camoufox
+      - key: MKV_HEADLESS
+        value: "true"
+      - key: MKV_KEEPALIVE
+        value: "true"       # self-ping /health every 10 min to prevent cold-start sleep
+      - key: MKV_KEEPALIVE_MIN
+        value: "10"
+      - key: MKV_DATA_DIR
+        value: /tmp/data    # ephemeral on Render; fine for cache/history
