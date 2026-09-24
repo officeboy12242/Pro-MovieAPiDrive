@@ -50,17 +50,30 @@ set MKV_ENGINE=drissionpage                      # or camoufox
 
 | Scenario | Latency |
 |---|---|
-| Cold start (engine + CF clearance, prewarmed at boot) | ~40-75s once |
-| Live search, warm session (in-page fetch, no navigation) | **0.5-1s** |
+| Cold start (background warmer clears CF once) | ~50-95s, requests do not wait for it |
+| Request while warming | stale result or `503` + `Retry-After` within `MKV_REQUEST_WAIT` (25s) |
+| Live search, warm session (plain HTTP via curl_cffi, no browser) | **~1-1.5s** |
 | Cached term (within TTL) | **<5ms** |
 
-The fast path fetches the signed URL via in-page `fetch()` with the
-`X-Requested-With: XMLHttpRequest` header — the same call mkvbase's own client
-makes — so no page navigation happens after the initial Cloudflare clearance.
-Transient site flakes are absorbed by one automatic retry.
+After one browser clearance, every search is signed locally and fetched over
+plain HTTPS with a Firefox TLS fingerprint (curl_cffi). mkvbase re-issues its
+`mkv_*` cookies on every response; absorbing them keeps the session alive
+without a browser, so the browser is closed right after clearance and only
+relaunched when Cloudflare's `cf_clearance` itself expires.
 
 ## Deploy notes (server / Render)
 
-- Set `MKV_HEADLESS=true` (camoufox fine headless; drissionpage prefers visible for CF).
-- Camoufox needs its browser fetched once at build: `python -m camoufox fetch`.
-- First call after cold start takes ~15-40s (CF clearance); later calls ~2-5s.
+- `render.yaml` is the source of truth. Key settings: `MKV_ENGINE=camoufox`,
+  `MKV_HEADLESS=true`, `MKV_RELEASE_BROWSER=true`, `MKV_KEEPALIVE=true`.
+- Camoufox needs its browser fetched once at build: `python -m camoufox fetch` (Dockerfile does it).
+- Requests never block on the browser. Check `GET /health` -> `warmer`:
+  `state` (`warming` / `ready` / `failed`), `last_error`, `retry_after_s`, `plain_http_ok`,
+  plus `mem_mb` and `browser_open`.
+- If `warmer.state` stays `failed` with "Cloudflare did not clear", the host IP is
+  being challenged harder than a home IP. Set `MKV_PROXY=http://user:pass@host:port`
+  (residential) in the Render dashboard; the browser and curl_cffi both use it,
+  since `cf_clearance` is bound to the IP that solved it.
+- Keepalive pings the public `RENDER_EXTERNAL_URL`, so the free instance does not
+  sleep (a sleep wipes `/tmp` and forces a new clearance).
+- `MKV_SERVE_ONLY=true` turns off live scraping: `/search` and `/recent` only serve
+  results pushed via `POST /sync` or saved earlier.

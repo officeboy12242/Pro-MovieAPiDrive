@@ -1,7 +1,10 @@
 # Render Blueprint — free plan variant
 # NOTE: free plan = 512MB RAM. Camoufox is memory-tuned via
-# MOZ_FORCE_DISABLE_E10S (single-process Firefox) + MALLOC_ARENA_MAX=2.
-# Keepalive is OFF on free: letting the instance sleep keeps RAM clean.
+# MOZ_FORCE_DISABLE_E10S (single-process Firefox) + MALLOC_ARENA_MAX=2, and the
+# browser is closed right after Cloudflare clears (MKV_RELEASE_BROWSER): searches
+# then run over plain HTTP, so RAM stays low between clearances.
+# Keepalive is ON: it pings the public URL so the instance (and its warm session)
+# does not sleep. /tmp is wiped on every sleep/restart, forcing a new clearance.
 services:
   - type: web
     name: pro-movieapidrive
@@ -15,9 +18,13 @@ services:
       - key: MKV_HEADLESS
         value: "true"
       - key: MKV_KEEPALIVE
-        value: "false"
+        value: "true"
       - key: MKV_PREWARM
-        value: "true"       # clear CF at boot so the first search is fast
+        value: "true"       # warmer clears CF at boot, in the background
+      - key: MKV_RELEASE_BROWSER
+        value: "true"       # close Firefox once plain HTTP is verified
+      - key: MKV_REQUEST_WAIT
+        value: "25"         # max seconds a request waits for the warmer, then 503/stale
       - key: MKV_CACHE_TTL
         value: "300"        # repeat searches within 5 min are served instantly
       - key: MKV_DATA_DIR
@@ -26,3 +33,7 @@ services:
         value: "1"
       - key: MALLOC_ARENA_MAX
         value: "2"
+      # Optional: residential proxy, only if /health shows Cloudflare never clears
+      # from Render's datacenter IP. Set the value in the Render dashboard, never in git.
+      - key: MKV_PROXY
+        sync: false

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 
 
 class Store:
@@ -13,9 +14,12 @@ class Store:
         self.history_path = os.path.join(data_dir, "history.jsonl")
         self._lock = threading.Lock()
 
-    def record(self, kind: str, term: str, payload: dict) -> str | None:
+    def _path(self, kind: str, term: str) -> str:
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in term.lower())[:60] or "recent"
-        out_path = os.path.join(self.data_dir, f"{kind}_{safe}.json")
+        return os.path.join(self.data_dir, f"{kind}_{safe}.json")
+
+    def record(self, kind: str, term: str, payload: dict) -> str | None:
+        out_path = self._path(kind, term)
         try:
             with self._lock:
                 with open(self.history_path, "a", encoding="utf-8") as f:
@@ -40,6 +44,16 @@ class Store:
         except Exception:
             pass
         return out
+
+    def load_record(self, kind: str, term: str) -> tuple[dict, float] | None:
+        """Last saved result for (kind, term) and its age in seconds, if any."""
+        p = self._path(kind, term)
+        try:
+            with open(p, encoding="utf-8") as f:
+                obj = json.load(f)
+            return (obj, time.time() - os.path.getmtime(p)) if obj.get("results") else None
+        except Exception:
+            return None
 
     def load(self, filename: str) -> dict | None:
         if "/" in filename or "\\" in filename or not filename.endswith(".json"):

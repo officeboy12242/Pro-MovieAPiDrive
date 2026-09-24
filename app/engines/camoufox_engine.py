@@ -6,6 +6,7 @@ calls through a single-worker executor (see app/main.py).
 from __future__ import annotations
 
 import time
+import urllib.parse
 
 from .base import BaseEngine, Session, looks_like_challenge
 
@@ -13,9 +14,10 @@ from .base import BaseEngine, Session, looks_like_challenge
 class CamoufoxEngine(BaseEngine):
     name = "camoufox"
 
-    def __init__(self, headless: bool = True, humanize: bool = True):
+    def __init__(self, headless: bool = True, humanize: bool = True, proxy: str | None = None):
         self.headless = headless
         self.humanize = humanize
+        self.proxy = proxy  # e.g. http://user:pass@host:port (residential, when the host IP is CF-blocked)
         self._cm = None
         self._pw = None
         self._ctx = None
@@ -28,6 +30,12 @@ class CamoufoxEngine(BaseEngine):
         kwargs = {"headless": self.headless}
         if self.humanize:
             kwargs["humanize"] = True
+        if self.proxy:
+            p = urllib.parse.urlsplit(self.proxy)
+            kwargs["proxy"] = {"server": f"{p.scheme}://{p.hostname}:{p.port}",
+                               "username": urllib.parse.unquote(p.username or ""),
+                               "password": urllib.parse.unquote(p.password or "")}
+            kwargs["geoip"] = True  # timezone/locale follow the proxy IP, not the host
         self._cm = Camoufox(**kwargs)
         self._pw = self._cm.__enter__()
         self._ctx = self._pw.new_context()

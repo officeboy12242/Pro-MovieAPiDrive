@@ -21,7 +21,7 @@ def make_engine(name: str | None = None) -> BaseEngine:
         return DrissionPageEngine(headless=_headless_default(),
                                   user_data_dir=os.getenv("MKV_CHROME_PROFILE"))
     if name == "camoufox":
-        return CamoufoxEngine(headless=_headless_default())
+        return CamoufoxEngine(headless=_headless_default(), proxy=os.getenv("MKV_PROXY") or None)
     # auto: first library that imports wins
     for candidate, cls in (("drissionpage", DrissionPageEngine), ("camoufox", CamoufoxEngine)):
         try:

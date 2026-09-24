@@ -48,6 +48,10 @@ class BaseEngine(ABC):
         """In-page XHR fetch without navigation. Returns None if unsupported/failed."""
         return None
 
+    def is_open(self) -> bool:
+        """Whether a browser process is currently running (both engines keep _page)."""
+        return getattr(self, "_page", None) is not None
+
     @abstractmethod
     def close(self) -> None:
         ...
