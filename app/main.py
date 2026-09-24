@@ -21,8 +21,13 @@ from .engines import make_engine
 from .keepalive import start_keepalive
 from .store import Store
 
-app = FastAPI(title="mkvbase-cf-api", version="1.1.0")
+app = FastAPI(title="mkvbase-cf-api", version="1.2.0")
 start_keepalive()
+
+# Ingest key for split-plane sync (POST /sync). Required only when MKV_SYNC_KEY is set.
+_SYNC_KEY = os.getenv("MKV_SYNC_KEY", "")
+# Serve-only mode (Render free): /search never live-scrapes, only serves synced results.
+_SERVE_ONLY = os.getenv("MKV_SERVE_ONLY", "").lower() in ("1", "true", "yes")
 
 _client: MkvbaseClient | None = None
 _engine_obj = None
@@ -86,10 +91,39 @@ def _startup() -> None:
 
 @app.get("/health")
 def health():
+    sess = None
+    if _client is not None and _client._session is not None:
+        sess = {"cookies": len(_client._session.cookies),
+                "mkv_session": _client._session.has_mkv_session(),
+                "cf_clearance": bool(_client._session.cookies.get("cf_clearance"))}
     return {"ok": True, "engine": _engine_obj.name if _engine_obj else os.getenv("MKV_ENGINE", "auto"),
+            "client_engine": _client.engine_name if _client else "not-init",
+            "session": sess,
+            "bootstrap_timeout_s": _client._bootstrap_timeout if _client else None,
             "cache": {"entries": len(_cache), "hits": _cache_hits, "misses": _cache_misses,
                       "ttl_s": _CACHE_TTL_S},
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+@app.post("/sync")
+def sync(payload: dict, x_sync_key: str | None = None):
+    """Split-plane ingest: a scraper elsewhere (home PC) pushes full result objects.
+    Body: {"term": str, "results": [...], "count": int, ...} — the same shape
+    client.search() produces. Guarded by MKV_SYNC_KEY when set."""
+    if _SYNC_KEY and x_sync_key != _SYNC_KEY:
+        raise HTTPException(status_code=401, detail="bad sync key")
+    term = (payload.get("term") or payload.get("_term") or "").strip()
+    if not term:
+        raise HTTPException(status_code=400, detail="missing term")
+    obj = dict(payload)
+    obj["_source"] = "sync"
+    obj["_synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _cache_put(term, obj)  # serves /search instantly; lives as long as the process
+    if obj.get("results"):
+        Store(os.getenv("MKV_DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
+              ).record("search", term, obj)
+    return {"ok": True, "term": term, "count": obj.get("count"),
+            "cached": True, "cache_entries": len(_cache)}
 
 
 @app.get("/search")
