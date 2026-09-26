@@ -90,27 +90,99 @@ class MkvbaseClient:
     def _load_persisted_session(self) -> None:
         sf = self._session_file()
         if not sf or not os.path.exists(sf):
-            return
-        try:
-            with open(sf, encoding="utf-8") as f:
-                data = json.load(f)
-            s = Session(cookies=data.get("cookies", {}), user_agent=data.get("user_agent", ""))
-            if s.has_mkv_session():
-                self._session = s
-        except Exception:
             pass
+        else:
+            try:
+                with open(sf, encoding="utf-8") as f:
+                    data = json.load(f)
+                s = Session(cookies=data.get("cookies", {}), user_agent=data.get("user_agent", ""))
+                if s.has_mkv_session():
+                    self._session = s
+            except Exception:
+                pass
+        if self._session is None:
+            self._load_shared_session()
+
+    # ------------------------------------------------------------------ shared session (Mongo)
+    def _mongo_sessions(self):
+        """sessions collection in the shared vault, or None when Mongo is not set.
+        Browser-capable hosts (PC) publish their CF-cleared session here; headless
+        hosts without a working browser (Termux phone, tiny VPS) borrow it and run
+        fully browser-free."""
+        try:
+            from .store import _mongo_uri
+            uri = _mongo_uri()
+        except Exception:
+            uri = None
+        if not uri:
+            return None
+        try:
+            from pymongo import MongoClient
+            return MongoClient(uri, serverSelectionTimeoutMS=8000, socketTimeoutMS=20000,
+                               maxPoolSize=2)[os.getenv("MKV_MONGO_DB", "mkvbase")].sessions
+        except Exception:
+            return None
+
+    def _load_shared_session(self) -> bool:
+        col = self._mongo_sessions()
+        if col is None:
+            return False
+        try:
+            doc = col.find_one({"_id": "mkvbase"})
+        except Exception:
+            return False
+        if not doc or not doc.get("cookies"):
+            return False
+        s = Session(cookies=doc["cookies"], user_agent=doc.get("user_agent", ""))
+        if s.has_mkv_session():
+            self._session = s
+            return True
+        return False
+
+    def _refresh_from_shared(self) -> bool:
+        """Pick up a session another host pushed (fresher cf_clearance)."""
+        col = self._mongo_sessions()
+        if col is None:
+            return False
+        try:
+            doc = col.find_one({"_id": "mkvbase"})
+        except Exception:
+            return False
+        if not doc or not doc.get("cookies"):
+            return False
+        s = Session(cookies=doc["cookies"], user_agent=doc.get("user_agent", ""))
+        if not s.has_mkv_session():
+            return False
+        with self._lock:
+            if self._session is not None and self._session.cookies == s.cookies:
+                return False  # already holding this exact session
+            self._session = s
+        self._persist_session()
+        return True
 
     def _persist_session(self) -> None:
         sf = self._session_file()
-        if not sf or self._session is None:
-            return
-        try:
-            os.makedirs(os.path.dirname(sf), exist_ok=True)
-            with open(sf, "w", encoding="utf-8") as f:
-                json.dump({"cookies": self._session.cookies,
-                           "user_agent": self._session.user_agent}, f)
-        except Exception:
-            pass
+        if sf and self._session is not None:
+            try:
+                os.makedirs(os.path.dirname(sf), exist_ok=True)
+                with open(sf, "w", encoding="utf-8") as f:
+                    json.dump({"cookies": self._session.cookies,
+                               "user_agent": self._session.user_agent}, f)
+            except Exception:
+                pass
+        # share with other hosts (phone crawls browser-free off this), throttled
+        col = self._mongo_sessions()
+        if col is not None and self._session is not None:
+            now = time.time()
+            if now - getattr(self, "_mongo_shared_at", 0.0) > 300:
+                try:
+                    col.update_one({"_id": "mkvbase"},
+                                   {"$set": {"cookies": self._session.cookies,
+                                             "user_agent": self._session.user_agent,
+                                             "ts": now}}, upsert=True)
+                    self._mongo_shared_at = now
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------ session state
     def _challenge_expired(self) -> bool:
@@ -158,9 +230,13 @@ class MkvbaseClient:
 
     def ensure_session(self, timeout_s: int | None = None) -> bool:
         """Engine thread only. Make the session usable, cheapest way first:
-        already valid -> renew mkv_* over plain HTTP -> browser clearance.
+        already valid -> renew mkv_* over plain HTTP -> borrow a shared session
+        from Mongo (another host's fresh clearance) -> browser clearance.
         Returns whether the plain-HTTP path works (False = only the browser does)."""
         if self.session_ready() or self._renew_http() or self._bootstrap_http():
+            self.http_verified = True
+            return True
+        if self._refresh_from_shared() and (self.session_ready() or self._renew_http()):
             self.http_verified = True
             return True
         try:
