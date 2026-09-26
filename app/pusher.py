@@ -190,36 +190,33 @@ class Pusher:
         return disc
 
     def _warm_session(self) -> None:
-        """Clear Cloudflare once up front so discovery + recent don't fight over
-        the browser, and the console shows progress instead of a silent 'warming'."""
-        if self.client.session_ready():
-            print("[pusher] session already ready (disk/Mongo) — skipping browser",
-                  flush=True)
-            return
-        print("[pusher] clearing Cloudflare (Camoufox) — usually 1-2 min, wait…",
-              flush=True)
+        """Clear Cloudflare up front (short retries). Progress ticks every 10s."""
+        print("[pusher] warming session (reuse disk/Mongo if still valid)…", flush=True)
         t0 = time.time()
         stop = threading.Event()
 
         def _tick():
-            while not stop.wait(15):
+            while not stop.wait(10):
                 eng = getattr(self.client, "_engine", None)
                 phase = getattr(eng, "phase", None) if eng else None
-                age = ""
-                if eng is not None and hasattr(eng, "phase_since"):
-                    age = f" {time.time() - eng.phase_since:.0f}s"
-                print(f"[pusher] still clearing… {time.time() - t0:.0f}s"
-                      f"{f' (browser: {phase}{age})' if phase else ''}", flush=True)
+                print(f"[pusher] clearing… {time.time() - t0:.0f}s"
+                      f"{f' [{phase}]' if phase else ''}", flush=True)
 
         threading.Thread(target=_tick, daemon=True, name="warm-tick").start()
         try:
-            ok = self.client.ensure_session(timeout_s=240)
-            print(f"[pusher] Cloudflare clear done in {time.time() - t0:.0f}s "
-                  f"(plain HTTP {'ok' if ok else 'blocked — browser mode'})", flush=True)
+            # 3×70s attempts inside ensure_session; total budget ~210s worst case,
+            # usually much faster when disk/Mongo/cookiefree hits.
+            ok = self.client.ensure_session(timeout_s=210)
+            if ok and self.client.session_ready():
+                print(f"[pusher] READY in {time.time() - t0:.0f}s — crawling starts now",
+                      flush=True)
+            else:
+                print(f"[pusher] warm finished in {time.time() - t0:.0f}s but session "
+                      f"not verified — scrapes will retry clear", flush=True)
         except Exception as e:
-            print(f"[pusher] Cloudflare clear FAILED after {time.time() - t0:.0f}s: "
-                  f"{type(e).__name__}: {str(e)[:180]}", flush=True)
-            print("[pusher] will keep retrying on each scrape", flush=True)
+            print(f"[pusher] warm FAILED after {time.time() - t0:.0f}s: "
+                  f"{type(e).__name__}: {str(e)[:160]}", flush=True)
+            print("[pusher] scrapes will keep retrying clear", flush=True)
         finally:
             stop.set()
 

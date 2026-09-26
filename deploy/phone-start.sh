@@ -30,6 +30,12 @@ if [ -n "${DISPLAY:-}" ] && [ "${MKV_FORCE_HEADLESS:-}" != "1" ]; then
 else
   export MKV_HEADLESS="${MKV_HEADLESS:-true}"
 fi
+# Full Firefox prefs (not lean) — Turnstile fails more on stripped browsers.
+export MKV_LEAN_BROWSER=false
+# Short burst clears: 3 attempts × 70s, verify plain HTTP before declaring ready.
+export MKV_CLEAR_ATTEMPTS="${MKV_CLEAR_ATTEMPTS:-3}"
+export MKV_CLEAR_ATTEMPT_S="${MKV_CLEAR_ATTEMPT_S:-70}"
+export MKV_BOOTSTRAP_TIMEOUT="${MKV_BOOTSTRAP_TIMEOUT:-70}"
 # Firefox sandboxes use syscalls proot cannot serve -> disable them (standard
 # Termux/proot practice)
 export MOZ_DISABLE_CONTENT_SANDBOX=1
@@ -37,7 +43,7 @@ export MOZ_DISABLE_RDD_SANDBOX=1
 export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
 mkdir -p "${MKV_DATA_DIR:-$HOME/mkvdata}"
-echo "[phone] MKV_HEADLESS=$MKV_HEADLESS DISPLAY=${DISPLAY:-none}"
+echo "[phone] MKV_HEADLESS=$MKV_HEADLESS LEAN=$MKV_LEAN_BROWSER DISPLAY=${DISPLAY:-none}"
 
 # wake lock if Termux provides it (inside proot it usually does not; harmless)
 command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true

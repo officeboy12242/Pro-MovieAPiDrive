@@ -314,30 +314,49 @@ class MkvbaseClient:
         return True
 
     def ensure_session(self, timeout_s: int | None = None) -> bool:
-        """Engine thread only. Make the session usable, cheapest way first:
-        already valid -> renew mkv_* over plain HTTP -> borrow a shared session
-        from Mongo (another host's fresh clearance) -> no-browser bootstrap on a
-        friendly IP -> browser clearance (last resort).
-        Returns whether the plain-HTTP path works (False = only the browser does)."""
-        if self.session_ready() or self._renew_http() or self._bootstrap_http():
+        """Make the session usable, cheapest way first. Verifies plain HTTP before
+        claiming success. Browser clearance is tried in short bursts (not one long
+        hang) so a stuck Turnstile gets a fresh browser instead of burning 3 min."""
+        # 1) already-good / renew / owner key / shared / cookiefree IP
+        if self.session_ready() and self._renew_http():
             self.http_verified = True
             return True
-        if self._refresh_from_shared() and (self.session_ready() or self._renew_http()):
+        if self._bootstrap_http() or self._bootstrap_nokey():
             self.http_verified = True
             return True
-        if self._bootstrap_nokey():
+        if self._refresh_from_shared() and self._renew_http() and self.session_ready():
             self.http_verified = True
             return True
-        try:
-            self._bootstrap(timeout_s)
-        except Exception:
+        # 2) browser: several short attempts beat one long failed wait
+        per = int(os.getenv("MKV_CLEAR_ATTEMPT_S", "70"))
+        attempts = int(os.getenv("MKV_CLEAR_ATTEMPTS", "3"))
+        budget = int(timeout_s or self._bootstrap_timeout)
+        last_err: Exception | None = None
+        used = 0
+        for i in range(max(1, attempts)):
+            if used >= budget:
+                break
+            slice_s = min(per, budget - used)
+            t0 = time.time()
+            try:
+                self._bootstrap(slice_s)
+                if self._renew_http() and self.session_ready():
+                    self.http_verified = True
+                    if self._release_browser:
+                        self.release_browser()
+                    return True
+                last_err = MkvbaseError("browser cleared but plain HTTP still 403")
+            except Exception as e:
+                last_err = e
+            used += max(1, int(time.time() - t0))
             if self._release_browser:
-                self.release_browser()  # do not sit on ~300MB of Firefox between retries
-            raise
-        self.http_verified = self._renew_http()
-        if self.http_verified and self._release_browser:
-            self.release_browser()
-        return self.http_verified
+                self.release_browser()  # fresh browser next attempt
+            # brief pause so CF rate-limits / phone CPU can settle
+            time.sleep(2)
+        if last_err:
+            raise last_err
+        self.http_verified = False
+        return False
 
     def _bootstrap_http(self) -> bool:
         """With the owner's skip-rule header, bare /api/links issues mkv_* cookies
