@@ -32,6 +32,10 @@ class CamoufoxEngine(BaseEngine):
     name = "camoufox"
 
     def __init__(self, headless: bool = True, humanize: bool = True, proxy: str | None = None):
+        # No X server (Termux/proot, ssh without X): a headed launch would die with
+        # "no DISPLAY environment variable specified" -> auto-force headless.
+        if not headless and os.name == "posix" and not os.environ.get("DISPLAY"):
+            headless = True
         self.headless = headless
         self.humanize = humanize
         self.proxy = proxy  # e.g. http://user:pass@host:port (residential, when the host IP is CF-blocked)
