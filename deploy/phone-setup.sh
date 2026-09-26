@@ -11,7 +11,11 @@ apt-get update -y
 apt-get install -y python3-venv python3-pip git \
   libgtk-3-0 libdbus-glib-1-2 libxt6 libx11-xcb1 libxcomposite1 \
   libxdamage1 libxrandr2 libasound2 libxkbcommon0 libpango-1.0-0 \
-  libcairo2 libgdk-pixbuf-2.0-0 fonts-liberation
+  libcairo2 libgdk-pixbuf-2.0-0 fonts-liberation \
+  libgbm1 libxext6 libxfixes3 libxcb-shm0 libxcb1 libxss1 \
+  libatk1.0-0 libatk-bridge2.0-0 libcups2 || true
+# noble (24.04) t64 transition names where the plain ones do not exist
+apt-get install -y libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 || true
 
 echo "==> python venv + deps"
 python3 -m venv .venv

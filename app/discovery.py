@@ -187,7 +187,12 @@ class Discovery:
         while True:
             pass_new, pass_terms = 0, 0
             while self.queued and pass_terms < self.max_pass_terms:
-                info = self.step()
+                try:
+                    info = self.step()
+                except Exception as e:
+                    # one bad term must never kill the crawl thread
+                    info = {"status": f"step-error: {type(e).__name__}: {str(e)[:90]}"}
+                    time.sleep(5)
                 pass_terms += 1
                 if info.get("status") == "ok":
                     pass_new += info.get("new", 0)
