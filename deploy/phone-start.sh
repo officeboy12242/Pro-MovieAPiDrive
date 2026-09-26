@@ -11,9 +11,15 @@ if [ -f "$HOME/mkv.env" ]; then
   . "$HOME/mkv.env"
 fi
 
-if [ "${MKV_SYNC_KEY:-}" = "PASTE_SYNC_KEY_HERE" ] || [ -z "${MKV_SYNC_KEY:-}" ]; then
-  echo "Edit ~/mkv.env first:  nano ~/mkv.env  (paste MKV_SYNC_KEY)"
+if [ -z "${MKV_MONGODB_URI:-}" ] || [ "${MKV_MONGODB_URI:-}" = "PASTE_MONGODB_URI_HERE" ]; then
+  echo "Edit ~/mkv.env first:  nano ~/mkv.env  (paste MKV_MONGODB_URI - the crawler needs it)"
   exit 1
+fi
+if [ "${MKV_SYNC_KEY:-}" = "PASTE_SYNC_KEY_HERE" ] || [ -z "${MKV_SYNC_KEY:-}" ]; then
+  echo "NOTE: no MKV_SYNC_KEY - crawler still fills the vault via Mongo, but"
+  echo "      pushes to Render /sync will fail (401). Paste the key later for"
+  echo "      Render-side recent/search serving."
+  sleep 3
 fi
 
 export MKV_RENDER_URL MKV_SYNC_KEY MKV_MONGODB_URI MKV_DATA_DIR MKV_DISCOVERY

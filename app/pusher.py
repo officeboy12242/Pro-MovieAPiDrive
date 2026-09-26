@@ -101,9 +101,10 @@ class Pusher:
         ids = {r.get("id") for r in rows if isinstance(r, dict)}
         if ids and ids == self.seen.recent_ids and not (self.force_recent or force):
             return f"recent: {len(rows)} rows unchanged, skipped POST"
+        # vault first: rows land in Atlas even if the Render push fails (401 etc.)
+        self.index.upsert(rows, source="recent")
         resp = self._push({"kind": "links", "term": "latest", "count": len(rows),
                            "results": rows})
-        self.index.upsert(rows, source="recent")
         self.seen.recent_ids = ids
         self.seen.terms[_RECENT_MARK] = time.time()
         self.seen.save()
@@ -138,8 +139,8 @@ class Pusher:
         for term in due:
             try:
                 obj = self.client.search(term)
-                resp = self._push({"kind": "search", "term": term, **obj})
                 self.index.upsert(obj.get("results") or [], source="search")
+                resp = self._push({"kind": "search", "term": term, **obj})
                 links = resp.get("links") or {}
                 print(f"[pusher] search {term!r}: {obj.get('count')} rows -> "
                       f"new {links.get('new', '?')} total {links.get('total', '?')}", flush=True)
