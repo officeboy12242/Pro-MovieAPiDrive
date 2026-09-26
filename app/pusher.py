@@ -70,6 +70,7 @@ class Seen:
 
 
 class Pusher:
+    TRENDING_EVERY = float(os.getenv("MKV_PUSHER_TRENDING_S", "1800"))
     def __init__(self, render_url: str, sync_key: str, client: MkvbaseClient, state_dir: str):
         self.render = render_url.rstrip("/")
         self.sync_key = sync_key
@@ -170,9 +171,24 @@ class Pusher:
               f"(first scrape clears Cloudflare — may take a minute)", flush=True)
         next_recent = 0.0
         next_search_tick = 0.0
+        next_trending = 0.0
         first_poll = True
+        disc = self.start_discovery()  # no-op unless MKV_DISCOVERY/--discover
         while True:
             now = time.monotonic()
+            if disc is not None and now >= next_trending:
+                # what real users are searching right now -> high-yield crawl seeds
+                try:
+                    titles = self.client.recent_trending()
+                    n = disc.seed_titles(titles)
+                    if n:
+                        print(f"[pusher] trending: seeded {n} terms from "
+                              f"{len(titles)} hot titles", flush=True)
+                    next_trending = now + self.TRENDING_EVERY
+                except Exception as e:
+                    print(f"[pusher] trending seed failed: {type(e).__name__}: {e}",
+                          flush=True)
+                    next_trending = now + 300
             if now >= next_recent:
                 # The first poll always POSTs: a fresh/empty backend (new Mongo
                 # collection, wiped /tmp) gets repopulated on pusher start.
@@ -208,9 +224,8 @@ def main(argv=None) -> None:
     p.add_terms([t for t in args.terms.split(",") if t.strip()])
     if args.discover:
         os.environ["MKV_DISCOVERY"] = "1"
-    p.start_discovery()
     try:
-        p.run()
+        p.run()  # run() starts the discovery thread itself when enabled
     except KeyboardInterrupt:
         print("\n[pusher] stopped", flush=True)
 

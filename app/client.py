@@ -336,6 +336,19 @@ class MkvbaseClient:
     def _recent_url(self, ck) -> str:
         return f"{self.base}/api/links"
 
+    def recent_trending(self) -> list[str]:
+        """GET /api/trending (found in the site's own bundles): titles users are
+        searching right now. No signing needed; empty list on any failure."""
+        try:
+            text = self._http_request(f"{self.base}/api/trending", timeout_s=15)
+        except (NeedsSession, MkvbaseError):
+            return []
+        try:
+            obj = json.loads(text[text.find("{"):text.rfind("}") + 1])
+            return [str(t).strip() for t in (obj.get("trending") or []) if str(t).strip()]
+        except Exception:
+            return []
+
     def recent_http(self) -> dict:
         """Any thread. Browser-free; raises NeedsSession when no clearance is usable."""
         return self._fetch_http(self._recent_url)

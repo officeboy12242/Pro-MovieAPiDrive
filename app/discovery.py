@@ -108,14 +108,33 @@ class Discovery:
         except Exception:
             pass
 
-    def _queue(self, term: str) -> bool:
+    def _queue(self, term: str, max_len: int | None = None) -> bool:
         t = term.strip().lower()
-        if (t and 3 <= len(t) <= self.max_word_len and t not in self.queued_set
+        cap = max_len or self.max_word_len
+        if (t and 3 <= len(t) <= cap and t not in self.queued_set
                 and t not in self.known_terms and t not in self.exhausted):
             self.queued.append(t)
             self.queued_set.add(t)
             return True
         return False
+
+    def seed_titles(self, titles: list[str]) -> int:
+        """High-yield external seeds (e.g. /api/trending — what real users are
+        searching right now). Queue the full title (its search returns all its
+        links at once) plus its individual words."""
+        added = 0
+        for title in titles or []:
+            title = (title or "").strip()
+            if not title:
+                continue
+            if self._queue(title, max_len=80):
+                added += 1
+            for w in _WORD.findall(title.lower()):
+                if w not in _STOP and self._queue(w):
+                    added += 1
+        if added:
+            self.save()
+        return added
 
     # ------------------------------------------------------------------ crawl
     def _mine(self, titles: list[str]) -> int:
@@ -125,6 +144,10 @@ class Discovery:
                 if w not in _STOP and self._queue(w):
                     added += 1
         return added
+
+    def stats_line(self) -> str:
+        return (f"terms done={self.done_terms} queued={len(self.queued)} "
+                f"exhausted={len(self.exhausted)} rows_found={self.found_rows}")
 
     def step(self) -> dict:
         """One signed search + merge into the index. Summary dict for logging."""
