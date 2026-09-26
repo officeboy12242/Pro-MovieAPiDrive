@@ -21,7 +21,11 @@ for line in ("MKV_MONGODB_URI", "MKV_SYNC_KEY", "MKV_DATA_DIR", "MKV_DISCOVERY")
     env[line] = os.environ.get(line, "")
 if not env["MKV_MONGODB_URI"]:
     try:
-        env["MKV_MONGODB_URI"] = open(os.path.expanduser("~/mkv.env")).read()
+        for ln in open(os.path.expanduser("~/mkv.env")):
+            if "=" in ln and not ln.strip().startswith("#"):
+                k, _, v = ln.strip().partition("=")
+                env[k] = v
+        os.environ.update({k: v for k, v in env.items() if v})
     except Exception:
         pass
 print("MKV_MONGODB_URI set:", bool(env["MKV_MONGODB_URI"])
