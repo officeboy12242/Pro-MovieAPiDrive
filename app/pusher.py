@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,7 +36,9 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.client import MkvbaseClient, MkvbaseError  # noqa: E402
+from app.discovery import Discovery  # noqa: E402
 from app.engines import make_engine  # noqa: E402
+from app.store import make_index  # noqa: E402
 
 _RECENT_MARK = "_recent_"
 
@@ -142,6 +145,24 @@ class Pusher:
                 print(f"[pusher] search {term!r} push failed: {type(e).__name__}: {e}", flush=True)
         return done
 
+    # ------------------------------------------------------------------ discovery
+    def start_discovery(self, log=print) -> "Discovery | None":
+        """Back-catalog crawler (MKV_DISCOVERY=1 or --discover): searches mkvbase
+        term-by-term and merges rows DIRECTLY into the Mongo index (no /sync hop).
+        Needs a durable index to make sense; skipped when Mongo is not configured."""
+        if os.getenv("MKV_DISCOVERY", "").lower() not in ("1", "true", "yes"):
+            return None
+        idx = make_index(self.seen.path and os.path.dirname(self.seen.path) or ".")
+        if (idx.stats().get("backend") != "mongodb"):
+            log("[discovery] DISABLED: MongoDB not configured "
+                "(set MKV_MONGODB_URI or data/mongo_uri.txt) — file index would "
+                "never reach Render", flush=True)
+            return None
+        disc = Discovery(self.client, idx, os.path.dirname(self.seen.path) or ".")
+        threading.Thread(target=disc.run, kwargs={"log": log}, daemon=True,
+                         name="discovery").start()
+        return disc
+
     # ------------------------------------------------------------------ main loop
     def run(self) -> None:
         print(f"[pusher] render={self.render} recent_every={self.recent_every:.0f}s "
@@ -177,12 +198,17 @@ def main(argv=None) -> None:
     ap.add_argument("--terms", default=os.getenv("MKV_PUSHER_TERMS", ""),
                     help="comma-separated terms to keep refreshed (added to remembered ones)")
     ap.add_argument("--data-dir", default=os.getenv("MKV_DATA_DIR", "data"))
+    ap.add_argument("--discover", action="store_true", default=None,
+                    help="also crawl the back catalog into Mongo (or MKV_DISCOVERY=1)")
     args = ap.parse_args(argv)
     if not args.render_url:
         ap.error("--render-url or MKV_RENDER_URL is required")
     client = MkvbaseClient(make_engine(), cache_path=os.path.join(args.data_dir, "pusher"))
     p = Pusher(args.render_url, args.sync_key, client, args.data_dir)
     p.add_terms([t for t in args.terms.split(",") if t.strip()])
+    if args.discover:
+        os.environ["MKV_DISCOVERY"] = "1"
+    p.start_discovery()
     try:
         p.run()
     except KeyboardInterrupt:
