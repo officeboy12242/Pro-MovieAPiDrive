@@ -1,16 +1,19 @@
 """Cloudflare clearance worker for Termux.
 
-mkvbase serves a managed \"Just a moment...\" challenge (no Turnstile checkbox).
-Camoufox under proot/Xvfb is fingerprint-blocked (clicks=0 forever). Real
-Chromium via nodriver headful under Xvfb is what clears this site.
+mkvbase uses a managed \"Just a moment...\" challenge. Camoufox is fingerprint-
+blocked under proot/Xvfb. Real Chromium via nodriver is required.
 
-  # install once:
+Chromium source (first match wins):
+  1) MKV_CHROME_PATH
+  2) Playwright-bundled Chromium  (~/.cache/ms-playwright/...)
+  3) system chromium / chromium-browser
+
+Install once:
   bash deploy/phone-setup.sh
 
-  # test:
-  bash deploy/phone-start.sh   # wraps xvfb
-  # or:
+Test:
   xvfb-run -a -s \"-screen 0 1280x720x24\" \\
+    env MKV_HEADLESS=false MKV_CLEAR_ENGINE=nodriver \\
     .venv/bin/python -m app.cf_clear_worker --timeout 120
 """
 from __future__ import annotations
@@ -22,6 +25,7 @@ import os
 import shutil
 import sys
 import time
+from pathlib import Path
 
 API = "https://mkvbase.site/api/links"
 _MKV = ("mkv_client_key", "mkv_challenge", "mkv_seq")
@@ -31,28 +35,75 @@ def _mkv_ok(ck: dict) -> bool:
     return all(k in ck for k in _MKV)
 
 
+def _find_playwright_chrome() -> str | None:
+    """Locate Playwright-downloaded Chromium (works in proot; no snap)."""
+    roots = []
+    env = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if env:
+        roots.append(Path(env))
+    roots += [
+        Path.home() / ".cache" / "ms-playwright",
+        Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ms-playwright",
+    ]
+    # also next to the venv if playwright put it there
+    try:
+        import playwright
+        roots.append(Path(playwright.__file__).resolve().parent / "driver" / "package" / ".local-browsers")
+    except Exception:
+        pass
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pat in ("chromium-*/chrome-linux*/chrome",
+                    "chromium_headless_shell-*/chrome-linux*/headless_shell",
+                    "chromium-*/chrome-linux/chrome"):
+            candidates.extend(root.glob(pat))
+    # prefer full chrome over headless_shell
+    for c in sorted(candidates, key=lambda p: ("headless" in str(p).lower(), str(p)), reverse=False):
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+    return None
+
+
 def _find_chromium() -> str | None:
     env = os.getenv("MKV_CHROME_PATH")
     if env and os.path.isfile(env):
         return env
+    pw = _find_playwright_chrome()
+    if pw:
+        return pw
     for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"):
         p = shutil.which(name)
         if p:
+            # snap stub in proot is useless
+            try:
+                if os.path.islink(p) and "snap" in os.readlink(p):
+                    continue
+            except Exception:
+                pass
             return p
     for p in ("/usr/bin/chromium", "/usr/bin/chromium-browser",
-              "/usr/bin/google-chrome", "/snap/bin/chromium"):
+              "/usr/bin/google-chrome"):
         if os.path.isfile(p):
             return p
     return None
 
 
 async def clear_nodriver(url: str, timeout_s: int, headless: bool) -> dict:
-    import nodriver as uc
+    try:
+        import nodriver as uc
+    except ImportError:
+        return {"ok": False, "engine": "nodriver", "cookies": {},
+                "error": "nodriver not installed — run: .venv/bin/pip install nodriver"}
 
     exe = _find_chromium()
     if not exe:
-        return {"ok": False, "error": "chromium not installed — run: bash deploy/phone-setup.sh",
-                "engine": "nodriver", "cookies": {}}
+        return {
+            "ok": False, "engine": "nodriver", "cookies": {},
+            "error": ("no Chromium found. Run: bash deploy/phone-setup.sh "
+                      "(installs Playwright Chromium for proot)"),
+        }
 
     if not headless and os.name == "posix" and not os.environ.get("DISPLAY"):
         headless = True
@@ -91,20 +142,14 @@ async def clear_nodriver(url: str, timeout_s: int, headless: bool) -> dict:
                 except Exception:
                     ua = ""
                 return {
-                    "ok": True,
-                    "engine": "nodriver",
-                    "cookies": ck,
-                    "user_agent": ua,
-                    "took_s": round(time.time() - t0, 1),
-                    "title": last_title[:120],
-                    "cookie_names": sorted(ck),
-                    "cf": "cf_clearance" in ck,
-                    "chrome": exe,
+                    "ok": True, "engine": "nodriver", "cookies": ck,
+                    "user_agent": ua, "took_s": round(time.time() - t0, 1),
+                    "title": last_title[:120], "cookie_names": sorted(ck),
+                    "cf": "cf_clearance" in ck, "chrome": exe,
                 }
 
-            # managed challenge: wait; occasionally reload if stuck >45s with no cf
             elapsed = time.time() - t0
-            if elapsed > 45 and "cf_clearance" not in ck and int(elapsed) % 20 < 2:
+            if elapsed > 40 and "cf_clearance" not in ck and int(elapsed) % 25 < 2:
                 try:
                     await tab.reload()
                 except Exception:
@@ -122,14 +167,9 @@ async def clear_nodriver(url: str, timeout_s: int, headless: bool) -> dict:
         except Exception:
             html_hint = ""
         return {
-            "ok": False,
-            "engine": "nodriver",
-            "cookies": ck,
-            "took_s": round(time.time() - t0, 1),
-            "title": last_title[:120],
-            "cookie_names": sorted(ck),
-            "html_hint": html_hint,
-            "chrome": exe,
+            "ok": False, "engine": "nodriver", "cookies": ck,
+            "took_s": round(time.time() - t0, 1), "title": last_title[:120],
+            "cookie_names": sorted(ck), "html_hint": html_hint, "chrome": exe,
             "error": "timeout without mkv_* cookies",
         }
     finally:
@@ -139,79 +179,17 @@ async def clear_nodriver(url: str, timeout_s: int, headless: bool) -> dict:
             pass
 
 
-def clear_camoufox(url: str, timeout_s: int, headless: bool) -> dict:
-    """Fallback only — usually fingerprint-blocked on Termux for managed CF."""
-    from camoufox.sync_api import Camoufox
-
-    if not headless and os.name == "posix" and not os.environ.get("DISPLAY"):
-        headless = True
-    t0 = time.time()
-    kwargs = dict(
-        headless=headless,
-        humanize=True,
-        geoip=False,
-        window=(1280, 720),
-        config={"forceScopeAccess": True},
-        disable_coop=True,
-        i_know_what_im_doing=True,
-    )
-    with Camoufox(**kwargs) as browser:
-        page = browser.new_page()
-        page.set_viewport_size({"width": 1280, "height": 720})
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        except Exception as e:
-            return {"ok": False, "engine": "camoufox", "error": f"goto: {e}", "cookies": {}}
-        page.wait_for_timeout(5000)
-        deadline = t0 + timeout_s
-        while time.time() < deadline:
-            ck = {c["name"]: c["value"] for c in page.context.cookies() if c.get("value")}
-            if _mkv_ok(ck):
-                return {
-                    "ok": True, "engine": "camoufox", "cookies": ck,
-                    "user_agent": page.evaluate("navigator.userAgent"),
-                    "took_s": round(time.time() - t0, 1),
-                    "title": (page.title() or "")[:120],
-                    "cookie_names": sorted(ck), "cf": "cf_clearance" in ck,
-                }
-            if "cf_clearance" in ck and not _mkv_ok(ck):
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-            page.wait_for_timeout(1000)
-        ck = {c["name"]: c["value"] for c in page.context.cookies() if c.get("value")}
-        return {
-            "ok": False, "engine": "camoufox", "cookies": ck,
-            "took_s": round(time.time() - t0, 1),
-            "title": (page.title() or "")[:120],
-            "cookie_names": sorted(ck),
-            "html_hint": (page.content() or "")[:180].replace("\n", " "),
-            "error": "timeout without mkv_* cookies",
-        }
-
-
 def clear(url: str, timeout_s: int, headless: bool) -> dict:
-    engine = (os.getenv("MKV_CLEAR_ENGINE") or "auto").lower()
-    # Prefer nodriver/chromium — Camoufox is blocked on this CF for Termux.
-    if engine in ("auto", "nodriver"):
-        try:
-            result = asyncio.run(clear_nodriver(url, timeout_s, headless))
-            if result.get("ok") or engine == "nodriver":
-                return result
-            # auto: fall through to camoufox only if chromium missing
-            if "chromium not installed" not in (result.get("error") or ""):
-                return result
-        except Exception as e:
-            if engine == "nodriver":
-                return {"ok": False, "engine": "nodriver",
-                        "error": f"{type(e).__name__}: {e}", "cookies": {}}
+    engine = (os.getenv("MKV_CLEAR_ENGINE") or "nodriver").lower()
+    # Never silently burn 120s on Camoufox — it cannot clear this CF on Termux.
+    if engine == "camoufox":
+        return {"ok": False, "engine": "camoufox", "cookies": {},
+                "error": "Camoufox cannot clear mkvbase CF on Termux. Use MKV_CLEAR_ENGINE=nodriver"}
     try:
-        return clear_camoufox(url, timeout_s, headless)
+        return asyncio.run(clear_nodriver(url, timeout_s, headless))
     except Exception as e:
-        return {"ok": False, "engine": "camoufox",
-                "error": f"{type(e).__name__}: {e}", "cookies": {}}
+        return {"ok": False, "engine": "nodriver", "cookies": {},
+                "error": f"{type(e).__name__}: {e}"}
 
 
 def main(argv=None) -> int:
@@ -221,6 +199,10 @@ def main(argv=None) -> int:
     ap.add_argument("--headless", default=os.getenv("MKV_HEADLESS", "false"))
     args = ap.parse_args(argv)
     headless = str(args.headless).lower() in ("1", "true", "yes")
+    # diagnose chrome path up front on stderr so Termux users see it
+    chrome = _find_chromium()
+    print(f"[cf_clear] chrome={chrome or 'NOT FOUND'} engine={os.getenv('MKV_CLEAR_ENGINE', 'nodriver')}",
+          file=sys.stderr, flush=True)
     result = clear(args.url, args.timeout, headless)
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
     sys.stdout.flush()
