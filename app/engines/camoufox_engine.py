@@ -82,6 +82,7 @@ class CamoufoxEngine(BaseEngine):
             # REQUIRED for Turnstile: unlock closed shadow DOM (shadowRootUnl)
             "config": {"forceScopeAccess": True},
             "disable_coop": True,
+            "i_know_what_im_doing": True,  # required with disable_coop
             "window": (1280, 720),
             "env": {k: v for k, v in os.environ.items() if k not in _DROP_ENV},
         }
@@ -185,7 +186,55 @@ class CamoufoxEngine(BaseEngine):
             return False
 
     def get_session(self, url: str, timeout_s: int = 70) -> Session:
-        """Homepage (softer interstitial) → solve CF → harvest mkv_* from API URL."""
+        """Prefer the async camoufox-captcha worker (shadow-DOM Turnstile). Falls
+        back to in-process sync clear if the worker is unavailable."""
+        s = self._get_session_via_worker(url, timeout_s)
+        if s is not None:
+            return s
+        return self._get_session_sync(url, timeout_s)
+
+    def _get_session_via_worker(self, url: str, timeout_s: int) -> Session | None:
+        import json
+        import subprocess
+        import sys
+        self._set_phase("worker-clear")
+        # Close any sync browser first — Playwright sync+async in one process fights.
+        self.close()
+        env = dict(os.environ)
+        env.setdefault("MKV_GEOIP", "true")
+        cmd = [sys.executable, "-m", "app.cf_clear_worker",
+               "--url", url, "--timeout", str(timeout_s),
+               "--headless", "true" if self.headless else "false"]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout_s + 60, env=env,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        except Exception as e:
+            self._set_phase(f"worker-err:{type(e).__name__}")
+            return None
+        line = (proc.stdout or "").strip().splitlines()
+        line = line[-1] if line else ""
+        if not line:
+            err = ((proc.stderr or "") + (proc.stdout or ""))[-300:]
+            self._set_phase(f"worker-empty:{err[:80]}")
+            return None
+        try:
+            data = json.loads(line)
+        except Exception:
+            self._set_phase("worker-bad-json")
+            return None
+        cookies = data.get("cookies") or {}
+        self._set_phase(
+            f"worker cf={int('cf_clearance' in cookies)} "
+            f"mkv={int(all(k in cookies for k in ('mkv_client_key','mkv_challenge','mkv_seq')))} "
+            f"solved={data.get('solved')}")
+        if not data.get("ok") and not all(k in cookies for k in ("mkv_client_key", "mkv_challenge", "mkv_seq")):
+            # still return cookies so caller can see what we got in the error
+            return Session(cookies=cookies, user_agent=data.get("user_agent") or "")
+        return Session(cookies=cookies, user_agent=data.get("user_agent") or "")
+
+    def _get_session_sync(self, url: str, timeout_s: int = 70) -> Session:
+        """Homepage → shadow-DOM click → harvest mkv_* (fallback path)."""
         page = self._ensure()
         deadline = time.time() + timeout_s
         base = "https://mkvbase.site"
@@ -200,11 +249,7 @@ class CamoufoxEngine(BaseEngine):
         while time.time() < deadline:
             has_cf, has_mkv = self._has_cf(), self._has_mkv()
             self._set_phase(f"clear cf={int(has_cf)} mkv={int(has_mkv)}")
-            if has_mkv and has_cf:
-                self._set_phase("done")
-                return Session(cookies=self._cookies(),
-                               user_agent=page.evaluate("navigator.userAgent"))
-            if has_mkv:  # cookiefree host: mkv_* without cf_clearance
+            if has_mkv:
                 self._set_phase("done")
                 return Session(cookies=self._cookies(),
                                user_agent=page.evaluate("navigator.userAgent"))
@@ -224,7 +269,6 @@ class CamoufoxEngine(BaseEngine):
                 last_click = time.time()
             time.sleep(0.3)
 
-        # final API attempt if we somehow got cf late
         if self._has_cf() and not self._has_mkv():
             self._goto(url, timeout_ms=20000)
             time.sleep(1.0)

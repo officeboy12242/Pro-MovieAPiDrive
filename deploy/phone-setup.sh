@@ -21,6 +21,8 @@ echo "==> python venv + deps"
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip -q
 .venv/bin/pip install -r requirements.txt -q
+# captcha solver (shadow-DOM Turnstile) — required on Termux
+.venv/bin/pip install -q "camoufox-captcha>=0.1.0" || true
 
 echo "==> fetching Camoufox browser (arm64) - one time, ~200MB"
 # marker file: re-running setup must never re-download ~200MB on mobile data
