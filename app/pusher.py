@@ -96,28 +96,37 @@ class Pusher:
 
     # ------------------------------------------------------------------ recent loop
     def poll_recent_once(self, force: bool = False) -> str:
+        print("[pusher] polling /api/links (recent)…", flush=True)
+        t0 = time.time()
         obj = self.client.recent()
         rows = obj.get("results") or []
         ids = {r.get("id") for r in rows if isinstance(r, dict)}
         if ids and ids == self.seen.recent_ids and not (self.force_recent or force):
-            return f"recent: {len(rows)} rows unchanged, skipped POST"
+            return (f"recent: {len(rows)} rows unchanged, skipped POST  "
+                    f"({time.time() - t0:.1f}s)")
         # vault first: rows land in Atlas even if the Render push fails (401 etc.)
         self.index.upsert(rows, source="recent")
-        resp = self._push({"kind": "links", "term": "latest", "count": len(rows),
-                           "results": rows})
+        try:
+            resp = self._push({"kind": "links", "term": "latest", "count": len(rows),
+                               "results": rows})
+            links = resp.get("links") or {}
+            total = links.get("total")
+            if not total:  # tolerate older API without links stats
+                try:
+                    with urllib.request.urlopen(f"{self.render}/health", timeout=30) as r:
+                        total = (json.loads(r.read() or b"{}").get("links") or {}).get("rows")
+                except Exception:
+                    pass
+            push_bit = (f"-> Render new {links.get('new', '?')} "
+                        f"updated {links.get('updated', '?')} total "
+                        f"{total if total is not None else '?'}")
+        except Exception as e:
+            push_bit = f"-> Render push skipped ({type(e).__name__}: {str(e)[:60]})"
         self.seen.recent_ids = ids
         self.seen.terms[_RECENT_MARK] = time.time()
         self.seen.save()
-        links = resp.get("links") or {}
-        total = links.get("total")
-        if not total:  # tolerate older API without links stats
-            try:
-                with urllib.request.urlopen(f"{self.render}/health", timeout=30) as r:
-                    total = (json.loads(r.read() or b"{}").get("links") or {}).get("rows")
-            except Exception:
-                pass
-        return (f"recent: pushed {len(rows)} rows -> new {links.get('new', '?')} "
-                f"updated {links.get('updated', '?')} total {total if total is not None else '?'}")
+        return (f"recent: vaulted {len(rows)} rows {push_bit}  "
+                f"({time.time() - t0:.1f}s)")
 
     # ------------------------------------------------------------------ search loop
     def add_terms(self, terms: list[str]) -> None:
@@ -138,12 +147,19 @@ class Pusher:
         done = []
         for term in due:
             try:
+                print(f"[pusher] searching {term!r}…", flush=True)
+                t0 = time.time()
                 obj = self.client.search(term)
                 self.index.upsert(obj.get("results") or [], source="search")
-                resp = self._push({"kind": "search", "term": term, **obj})
-                links = resp.get("links") or {}
-                print(f"[pusher] search {term!r}: {obj.get('count')} rows -> "
-                      f"new {links.get('new', '?')} total {links.get('total', '?')}", flush=True)
+                try:
+                    resp = self._push({"kind": "search", "term": term, **obj})
+                    links = resp.get("links") or {}
+                    push_bit = (f"-> Render new {links.get('new', '?')} "
+                                f"total {links.get('total', '?')}")
+                except Exception as e:
+                    push_bit = f"-> Render push skipped ({type(e).__name__})"
+                print(f"[pusher] search {term!r}: {obj.get('count')} rows {push_bit}  "
+                      f"({time.time() - t0:.1f}s)", flush=True)
                 self.seen.terms[term] = time.time()
                 self.seen.save()
                 done.append(term)
@@ -151,7 +167,8 @@ class Pusher:
                 print(f"[pusher] search {term!r} failed: {str(e)[:160]}", flush=True)
                 self.seen.terms[term] = now - self.search_every + 600  # retry in 10 min
             except Exception as e:
-                print(f"[pusher] search {term!r} push failed: {type(e).__name__}: {e}", flush=True)
+                print(f"[pusher] search {term!r} push failed: {type(e).__name__}: {e}",
+                      flush=True)
         return done
 
     # ------------------------------------------------------------------ discovery
@@ -180,10 +197,23 @@ class Pusher:
         next_recent = 0.0
         next_search_tick = 0.0
         next_trending = 0.0
+        next_heartbeat = 0.0
         first_poll = True
+        started = time.time()
         disc = self.start_discovery()  # no-op unless MKV_DISCOVERY/--discover
         while True:
             now = time.monotonic()
+            if now >= next_heartbeat:
+                up = int(time.time() - started)
+                disc_bit = ""
+                if disc is not None:
+                    disc_bit = (f" | discovery done={disc.done_terms} "
+                                f"queued={len(disc.queued)} rows={disc.found_rows}")
+                print(f"[alive] up {up // 60}m{up % 60:02d}s | "
+                      f"session={'ok' if self.client.session_ready() else 'warming'} | "
+                      f"watched_terms={max(0, len(self.seen.terms) - 1)}{disc_bit}",
+                      flush=True)
+                next_heartbeat = now + 60
             if disc is not None and now >= next_trending:
                 # what real users are searching right now -> high-yield crawl seeds
                 try:

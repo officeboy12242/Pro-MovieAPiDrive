@@ -146,22 +146,27 @@ class Discovery:
         return added
 
     def stats_line(self) -> str:
-        return (f"terms done={self.done_terms} queued={len(self.queued)} "
-                f"exhausted={len(self.exhausted)} rows_found={self.found_rows}")
+        return (f"done={self.done_terms} queued={len(self.queued)} "
+                f"exhausted={len(self.exhausted)} rows={self.found_rows}")
 
-    def step(self) -> dict:
+    def step(self, log=None) -> dict:
         """One signed search + merge into the index. Summary dict for logging."""
         if not self.queued:
             return {"status": "queue-empty", "queued": 0}
         term = self.queued.pop(0)
         self.queued_set.discard(term)
+        left = len(self.queued)
+        if log:
+            log(f"[discovery] crawling {term!r}  ({self.done_terms} done, {left} left in queue)",
+                flush=True)
         t0 = time.time()
         try:
             obj = self.client.search(term)
         except MkvbaseError as e:
             self.known_terms.add(term)  # retire the term; do not retry forever
             self.save()
-            return {"status": f"search-failed: {str(e)[:90]}", "term": term}
+            return {"status": "fail", "term": term, "err": str(e)[:90],
+                    "took_s": round(time.time() - t0, 1)}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
         mined = self._mine([r.get("title") or "" for r in rows])
         new = 0
@@ -177,29 +182,49 @@ class Discovery:
                 "mined": mined, "queued": len(self.queued),
                 "took_s": round(time.time() - t0, 1)}
 
+    def _fmt_step(self, info: dict) -> str:
+        term = info.get("term", "?")
+        took = info.get("took_s", "?")
+        if info.get("status") == "ok":
+            return (f"[discovery] ok {term!r}: {info.get('rows', 0)} rows, "
+                    f"{info.get('new', 0)} new, mined {info.get('mined', 0)} words "
+                    f"→ queue {info.get('queued', 0)}  ({took}s)  [{self.stats_line()}]")
+        if info.get("status") == "fail":
+            return (f"[discovery] FAIL {term!r}: {info.get('err', '?')}  ({took}s)  "
+                    f"[{self.stats_line()}]")
+        return f"[discovery] {info}"
+
     # ------------------------------------------------------------------ loop
     def run(self, log=print) -> None:
         """Polite forever-loop: bounded passes, cooldown when saturated,
         exhausted terms re-checked after each cooldown."""
         log(f"[discovery] start: {len(self.queued)} queued, {self.done_terms} done, "
-            f"{self.exhausted and len(self.exhausted)} exhausted, gap {self.gap_s:.0f}s",
+            f"{len(self.exhausted)} exhausted, gap {self.gap_s:.0f}s between searches",
             flush=True)
         while True:
             pass_new, pass_terms = 0, 0
             while self.queued and pass_terms < self.max_pass_terms:
                 try:
-                    info = self.step()
+                    info = self.step(log=log)
                 except Exception as e:
                     # one bad term must never kill the crawl thread
-                    info = {"status": f"step-error: {type(e).__name__}: {str(e)[:90]}"}
+                    info = {"status": "fail", "term": "?", "err":
+                            f"step-error: {type(e).__name__}: {str(e)[:90]}"}
                     time.sleep(5)
                 pass_terms += 1
                 if info.get("status") == "ok":
                     pass_new += info.get("new", 0)
-                log(f"[discovery] {info}", flush=True)
-                time.sleep(self.gap_s)
+                log(self._fmt_step(info), flush=True)
+                # tick during politeness gap so Termux isn't a silent black screen
+                left = int(self.gap_s)
+                while left > 0:
+                    log(f"[discovery] next crawl in {left}s…  [{self.stats_line()}]",
+                        flush=True)
+                    chunk = min(15, left)
+                    time.sleep(chunk)
+                    left -= chunk
             log(f"[discovery] pass done: {pass_terms} terms, {pass_new} new rows, "
-                f"{len(self.queued)} still queued", flush=True)
+                f"{len(self.queued)} still queued  [{self.stats_line()}]", flush=True)
             if pass_new < self.min_new_per_pass:
                 # re-check exhausted terms next pass: new uploads can revive them
                 revived = 0
@@ -207,14 +232,19 @@ class Discovery:
                     self.exhausted.discard(t)
                     if self._queue(t):
                         revived += 1
-                log(f"[discovery] saturated - cooling down "
-                    f"{self.cool_down_s / 60:.0f} min, re-queued {revived} old terms "
-                    "(new uploads keep flowing via the recent loop meanwhile)",
-                    flush=True)
-                time.sleep(self.cool_down_s)
+                cool = int(self.cool_down_s)
+                log(f"[discovery] saturated — cooling {cool // 60} min, "
+                    f"re-queued {revived} old terms "
+                    "(recent loop keeps updating meanwhile)", flush=True)
+                left = cool
+                while left > 0:
+                    log(f"[discovery] cooldown {left // 60}m {left % 60}s left…  "
+                        f"[{self.stats_line()}]", flush=True)
+                    chunk = min(60, left)
+                    time.sleep(chunk)
+                    left -= chunk
             elif not self.queued:
-                log("[discovery] queue drained without saturation - reseeding "
-                    "seeds for another sweep", flush=True)
+                log("[discovery] queue drained — reseeding for another sweep", flush=True)
                 for t in _SEEDS:
                     self.known_terms.discard(t)  # allow re-search of seeds
                     self._queue(t)
