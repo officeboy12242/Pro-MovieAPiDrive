@@ -189,11 +189,46 @@ class Pusher:
                          name="discovery").start()
         return disc
 
+    def _warm_session(self) -> None:
+        """Clear Cloudflare once up front so discovery + recent don't fight over
+        the browser, and the console shows progress instead of a silent 'warming'."""
+        if self.client.session_ready():
+            print("[pusher] session already ready (disk/Mongo) — skipping browser",
+                  flush=True)
+            return
+        print("[pusher] clearing Cloudflare (Camoufox) — usually 1-2 min, wait…",
+              flush=True)
+        t0 = time.time()
+        stop = threading.Event()
+
+        def _tick():
+            while not stop.wait(15):
+                eng = getattr(self.client, "_engine", None)
+                phase = getattr(eng, "phase", None) if eng else None
+                age = ""
+                if eng is not None and hasattr(eng, "phase_since"):
+                    age = f" {time.time() - eng.phase_since:.0f}s"
+                print(f"[pusher] still clearing… {time.time() - t0:.0f}s"
+                      f"{f' (browser: {phase}{age})' if phase else ''}", flush=True)
+
+        threading.Thread(target=_tick, daemon=True, name="warm-tick").start()
+        try:
+            ok = self.client.ensure_session(timeout_s=180)
+            print(f"[pusher] Cloudflare clear done in {time.time() - t0:.0f}s "
+                  f"(plain HTTP {'ok' if ok else 'blocked — browser mode'})", flush=True)
+        except Exception as e:
+            print(f"[pusher] Cloudflare clear FAILED after {time.time() - t0:.0f}s: "
+                  f"{type(e).__name__}: {str(e)[:180]}", flush=True)
+            print("[pusher] will keep retrying on each scrape", flush=True)
+        finally:
+            stop.set()
+
     # ------------------------------------------------------------------ main loop
     def run(self) -> None:
         print(f"[pusher] render={self.render} recent_every={self.recent_every:.0f}s "
-              f"search_every={self.search_every / 60:.0f}min terms={len(self.seen.terms) - 1} "
-              f"(first scrape clears Cloudflare — may take a minute)", flush=True)
+              f"search_every={self.search_every / 60:.0f}min terms={len(self.seen.terms) - 1}",
+              flush=True)
+        self._warm_session()  # one clear before any crawl threads start
         next_recent = 0.0
         next_search_tick = 0.0
         next_trending = 0.0
