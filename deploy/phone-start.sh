@@ -19,33 +19,38 @@ if [ "${MKV_SYNC_KEY:-}" = "PASTE_SYNC_KEY_HERE" ] || [ -z "${MKV_SYNC_KEY:-}" ]
   echo "NOTE: no MKV_SYNC_KEY - crawler still fills the vault via Mongo, but"
   echo "      pushes to Render /sync will fail (401). Paste the key later for"
   echo "      Render-side recent/search serving."
-  sleep 3
+  sleep 2
 fi
 
 export MKV_RENDER_URL MKV_SYNC_KEY MKV_MONGODB_URI MKV_DATA_DIR MKV_DISCOVERY
-# Under xvfb-run, DISPLAY is set — headed Camoufox clears Turnstile far more
-# reliably than headless. Override with MKV_FORCE_HEADLESS=1 if needed.
+
+# If someone ran `bash deploy/phone-start.sh` WITHOUT xvfb-run, wrap ourselves.
+# Tiny default Xvfb (640x480) breaks Turnstile — force 1280x720.
+_XVFB_OPTS="${MKV_XVFB_OPTS:--screen 0 1280x720x24}"
+if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
+  echo "[phone] re-exec under xvfb-run ${_XVFB_OPTS}"
+  exec xvfb-run -a -s "$_XVFB_OPTS" bash "$0" "$@"
+fi
+
+# Headed under Xvfb clears Turnstile; headless almost never does on proot.
 if [ -n "${DISPLAY:-}" ] && [ "${MKV_FORCE_HEADLESS:-}" != "1" ]; then
   export MKV_HEADLESS=false
 else
   export MKV_HEADLESS="${MKV_HEADLESS:-true}"
 fi
-# Full Firefox prefs (not lean) — Turnstile fails more on stripped browsers.
 export MKV_LEAN_BROWSER=false
-# Short burst clears: 3 attempts × 70s, verify plain HTTP before declaring ready.
+export MKV_GEOIP="${MKV_GEOIP:-true}"
 export MKV_CLEAR_ATTEMPTS="${MKV_CLEAR_ATTEMPTS:-3}"
-export MKV_CLEAR_ATTEMPT_S="${MKV_CLEAR_ATTEMPT_S:-70}"
-export MKV_BOOTSTRAP_TIMEOUT="${MKV_BOOTSTRAP_TIMEOUT:-70}"
-# Firefox sandboxes use syscalls proot cannot serve -> disable them (standard
-# Termux/proot practice)
+export MKV_CLEAR_ATTEMPT_S="${MKV_CLEAR_ATTEMPT_S:-75}"
+export MKV_BOOTSTRAP_TIMEOUT="${MKV_BOOTSTRAP_TIMEOUT:-75}"
+
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_RDD_SANDBOX=1
 export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
 mkdir -p "${MKV_DATA_DIR:-$HOME/mkvdata}"
-echo "[phone] MKV_HEADLESS=$MKV_HEADLESS LEAN=$MKV_LEAN_BROWSER DISPLAY=${DISPLAY:-none}"
+echo "[phone] MKV_HEADLESS=$MKV_HEADLESS DISPLAY=${DISPLAY:-none} GEOIP=$MKV_GEOIP"
 
-# wake lock if Termux provides it (inside proot it usually does not; harmless)
 command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
 
 while true; do
