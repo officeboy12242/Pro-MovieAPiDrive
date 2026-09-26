@@ -27,6 +27,7 @@ import re
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 from .engines.base import BaseEngine, Session
 from .protocol import build_search_url
@@ -58,7 +59,23 @@ class MkvbaseClient:
         self._origin_header = os.getenv("MKV_ORIGIN_HEADER", "X-Mkv-Key")
         self._release_browser = os.getenv("MKV_RELEASE_BROWSER", "true").lower() in ("1", "true", "yes")
         self.http_verified: bool | None = None  # did plain HTTP pass after the last clearance?
+        # cf_clearance values that just got a 403 — never re-borrow these from Mongo/disk
+        self._rejected_cf: set[str] = set()
+        # Playwright/Camoufox sync objects are thread-affine and refuse a running asyncio
+        # loop: every browser call hops to this one worker (pusher + discovery + API).
+        self._engine_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mkv-eng")
+        self._engine_tid: int | None = None
         self._load_persisted_session()
+
+    def _on_engine(self, fn, *args, timeout: float | None = None, **kwargs):
+        if self._engine_tid is not None and threading.get_ident() == self._engine_tid:
+            return fn(*args, **kwargs)
+
+        def run():
+            self._engine_tid = threading.get_ident()
+            return fn(*args, **kwargs)
+
+        return self._engine_pool.submit(run).result(timeout=timeout)
 
     # ------------------------------------------------------------------ engine (lazy)
     @property
@@ -77,9 +94,9 @@ class MkvbaseClient:
         return bool(self._engine and self._engine.is_open())
 
     def release_browser(self) -> None:
-        """Engine thread only. Close the browser; it relaunches lazily if needed again."""
+        """Close the browser; it relaunches lazily if needed again."""
         if self._engine is not None and self._engine.is_open():
-            self._engine.close()
+            self._on_engine(self._engine.close)
 
     # ------------------------------------------------------------------ session persistence
     def _session_file(self) -> str | None:
@@ -123,6 +140,10 @@ class MkvbaseClient:
         except Exception:
             return None
 
+    def _cf_rejected(self, cookies: dict) -> bool:
+        cf = (cookies or {}).get("cf_clearance") or ""
+        return bool(cf and cf in self._rejected_cf)
+
     def _load_shared_session(self) -> bool:
         col = self._mongo_sessions()
         if col is None:
@@ -132,6 +153,8 @@ class MkvbaseClient:
         except Exception:
             return False
         if not doc or not doc.get("cookies"):
+            return False
+        if self._cf_rejected(doc["cookies"]):
             return False
         s = Session(cookies=doc["cookies"], user_agent=doc.get("user_agent", ""))
         if s.has_mkv_session():
@@ -149,6 +172,8 @@ class MkvbaseClient:
         except Exception:
             return False
         if not doc or not doc.get("cookies"):
+            return False
+        if self._cf_rejected(doc["cookies"]):
             return False
         s = Session(cookies=doc["cookies"], user_agent=doc.get("user_agent", ""))
         if not s.has_mkv_session():
@@ -197,10 +222,12 @@ class MkvbaseClient:
             return 0.0
 
     def session_ready(self) -> bool:
+        # Cookiefree-friendly IPs (phone/residential) often have mkv_* with no
+        # cf_clearance; that is enough. CF-strict hosts get a 403 and re-clear.
         with self._lock:
             s = self._session
-            return bool(s and s.has_mkv_session() and (self._origin_key or s.cookies.get("cf_clearance"))
-                        and not self._challenge_expired())
+            return bool(s and s.has_mkv_session() and not self._challenge_expired()
+                        and not self._cf_rejected(s.cookies))
 
     def _absorb(self, s: Session, cookies) -> None:
         """Merge Set-Cookie values from a plain-HTTP response into the live session."""
@@ -212,13 +239,39 @@ class MkvbaseClient:
                     s.cookies[k] = v
             self._persist_session()
 
-    def _drop_session(self, s: Session) -> None:
+    def _drop_session(self, s: Session, *, cf_dead: bool = False) -> None:
         with self._lock:
             if self._session is s:
                 self._session = None
+        if not cf_dead:
+            return
+        cf = (s.cookies or {}).get("cf_clearance") or ""
+        if cf:
+            self._rejected_cf.add(cf)
+            if len(self._rejected_cf) > 8:  # ponytail: bounded set; drop oldest-ish extras
+                self._rejected_cf = set(list(self._rejected_cf)[-4:])
+        # wipe shared copy so other hosts do not keep re-adopting the corpse
+        col = self._mongo_sessions()
+        if col is not None and cf:
+            try:
+                doc = col.find_one({"_id": "mkvbase"}, {"cookies.cf_clearance": 1})
+                if doc and (doc.get("cookies") or {}).get("cf_clearance") == cf:
+                    col.delete_one({"_id": "mkvbase"})
+            except Exception:
+                pass
+        # and the on-disk session.json so the next start does not reload it
+        sf = self._session_file()
+        if sf and os.path.exists(sf):
+            try:
+                os.remove(sf)
+            except Exception:
+                pass
 
     def _bootstrap(self, timeout_s: int | None = None) -> Session:
-        """Engine thread only. Full browser clearance on the bare endpoint."""
+        """Full browser clearance on the bare endpoint (always on the engine thread)."""
+        return self._on_engine(self._bootstrap_locked, timeout_s)
+
+    def _bootstrap_locked(self, timeout_s: int | None = None) -> Session:
         s = self.engine.get_session(f"{self.base}/api/links", timeout_s=timeout_s or self._bootstrap_timeout)
         if not s.has_mkv_session():
             raise MkvbaseError(f"Cloudflare did not clear: no mkv_* cookies after {timeout_s or self._bootstrap_timeout}s "
@@ -320,8 +373,8 @@ class MkvbaseClient:
         clearance passes Cloudflare with plain HTTPS (no browser) -> 200 JSON."""
         with self._lock:
             s = self._session
-            if s is None or not (self._origin_key or s.cookies.get("cf_clearance")):
-                raise NeedsSession("no Cloudflare clearance yet")
+            if s is None or not s.has_mkv_session():
+                raise NeedsSession("no session yet")
             cookies, ua = dict(s.cookies), s.user_agent
         try:
             from curl_cffi import requests as cffi
@@ -356,7 +409,7 @@ class MkvbaseClient:
                 blocked += 1
             last = f"HTTP {r.status_code}"
         if blocked == len(order):  # every fingerprint refused: clearance dead (or skip rule not matching)
-            self._drop_session(s)
+            self._drop_session(s, cf_dead=True)
             raise NeedsSession("Cloudflare clearance expired (403)")
         raise MkvbaseError(f"plain-HTTP fetch failed: {last}")
 
@@ -397,12 +450,15 @@ class MkvbaseClient:
 
     # ------------------------------------------------------------------ browser fallback
     def _fetch_browser(self, make_url, timeout_s: int) -> tuple[dict, str]:
-        """Engine thread only. Used when plain HTTP does not pass on this host."""
+        """Browser fallback when plain HTTP does not pass on this host."""
+        return self._on_engine(self._fetch_browser_locked, make_url, timeout_s)
+
+    def _fetch_browser_locked(self, make_url, timeout_s: int) -> tuple[dict, str]:
         body = ""
         with self._lock:
             ck = dict(self._session.cookies) if self._session else None
         if ck is None:
-            self._bootstrap(timeout_s)
+            self._bootstrap_locked(timeout_s)  # already on engine thread
             ck = dict(self._session.cookies)
         # 1) in-page fetch from the cleared page
         try:
@@ -415,7 +471,7 @@ class MkvbaseClient:
         for mode in ("nav", "nav2"):
             try:
                 if mode == "nav2":
-                    self._bootstrap(timeout_s)
+                    self._bootstrap_locked(timeout_s)
                     ck = dict(self._session.cookies)
                 body, session = self.engine.fetch(make_url(ck), timeout_s=timeout_s)
                 with self._lock:
@@ -430,13 +486,17 @@ class MkvbaseClient:
         raise MkvbaseError(f"no JSON with 'results' in response: {snippet!r}")
 
     def _fetch(self, make_url, timeout_s: int) -> tuple[dict, str]:
-        """Engine thread only. Plain HTTP, then clearance + HTTP, then browser fetch."""
+        """Plain HTTP, then clearance + HTTP, then browser fetch. Safe from any thread."""
         try:
             return self._fetch_http(make_url), "http"
-        except NeedsSession:
+        except (NeedsSession, MkvbaseError):
+            pass
+        # ensure_session may "succeed" with a shared/persisted corpse that still 403s —
+        # catch that and fall through to a real browser clearance.
+        try:
             if self.ensure_session(timeout_s):
                 return self._fetch_http(make_url), "http"
-        except MkvbaseError:
+        except (NeedsSession, MkvbaseError):
             pass
         return self._fetch_browser(make_url, timeout_s)
 
