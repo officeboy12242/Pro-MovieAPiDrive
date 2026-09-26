@@ -71,10 +71,15 @@ class Seen:
 
 class Pusher:
     TRENDING_EVERY = float(os.getenv("MKV_PUSHER_TRENDING_S", "1800"))
+
     def __init__(self, render_url: str, sync_key: str, client: MkvbaseClient, state_dir: str):
         self.render = render_url.rstrip("/")
         self.sync_key = sync_key
         self.client = client
+        # Everything the pusher scrapes ALSO lands directly in the durable index
+        # (Atlas when MKV_MONGODB_URI/data-mongo_uri.txt is set). Render's /sync
+        # remains a serving layer; the vault is Mongo regardless of Render config.
+        self.index = make_index(state_dir)
         self.seen = Seen(os.path.join(state_dir, "pusher_state.json"))
         self.recent_every = float(os.getenv("MKV_PUSHER_RECENT_S", "120"))
         self.search_every = float(os.getenv("MKV_PUSHER_SEARCH_S", "3600"))
@@ -98,6 +103,7 @@ class Pusher:
             return f"recent: {len(rows)} rows unchanged, skipped POST"
         resp = self._push({"kind": "links", "term": "latest", "count": len(rows),
                            "results": rows})
+        self.index.upsert(rows, source="recent")
         self.seen.recent_ids = ids
         self.seen.terms[_RECENT_MARK] = time.time()
         self.seen.save()
@@ -133,6 +139,7 @@ class Pusher:
             try:
                 obj = self.client.search(term)
                 resp = self._push({"kind": "search", "term": term, **obj})
+                self.index.upsert(obj.get("results") or [], source="search")
                 links = resp.get("links") or {}
                 print(f"[pusher] search {term!r}: {obj.get('count')} rows -> "
                       f"new {links.get('new', '?')} total {links.get('total', '?')}", flush=True)
