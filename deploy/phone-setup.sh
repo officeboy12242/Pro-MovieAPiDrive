@@ -35,6 +35,7 @@ MKV_SYNC_KEY=PASTE_SYNC_KEY_HERE
 MKV_MONGODB_URI=PASTE_MONGODB_URI_HERE
 MKV_DATA_DIR=$HOME/mkvdata
 MKV_DISCOVERY=1
+MKV_HEADLESS=true
 EOF
   echo "created ~/mkv.env - now:  nano ~/mkv.env  (paste both keys)"
 fi
