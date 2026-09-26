@@ -19,7 +19,13 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt -q
 
 echo "==> fetching Camoufox browser (arm64) - one time, ~200MB"
-.venv/bin/python -m camoufox fetch
+# marker file: re-running setup must never re-download ~200MB on mobile data
+MARKER="$HOME/.mkv_camoufox_ok"
+if [ -f "$MARKER" ]; then
+  echo "    already fetched (marker found) - skipping"
+else
+  .venv/bin/python -m camoufox fetch && touch "$MARKER"
+fi
 
 echo "==> keys file ~/mkv.env"
 if [ ! -f "$HOME/mkv.env" ]; then
