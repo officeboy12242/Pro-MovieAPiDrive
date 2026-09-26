@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 
-from .base import BaseEngine, Session, looks_like_challenge
+from .base import BaseEngine, Session, check_launch_ram, looks_like_challenge
 
 
 class DrissionPageEngine(BaseEngine):
@@ -24,6 +24,7 @@ class DrissionPageEngine(BaseEngine):
     def _ensure(self):
         if self._page is not None:
             return self._page
+        check_launch_ram()
         from DrissionPage import ChromiumOptions, ChromiumPage
         co = ChromiumOptions()
         if self.headless:
