@@ -213,7 +213,7 @@ class Pusher:
 
         threading.Thread(target=_tick, daemon=True, name="warm-tick").start()
         try:
-            ok = self.client.ensure_session(timeout_s=180)
+            ok = self.client.ensure_session(timeout_s=240)
             print(f"[pusher] Cloudflare clear done in {time.time() - t0:.0f}s "
                   f"(plain HTTP {'ok' if ok else 'blocked — browser mode'})", flush=True)
         except Exception as e:

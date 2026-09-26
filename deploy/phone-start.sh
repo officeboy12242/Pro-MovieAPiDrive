@@ -23,15 +23,21 @@ if [ "${MKV_SYNC_KEY:-}" = "PASTE_SYNC_KEY_HERE" ] || [ -z "${MKV_SYNC_KEY:-}" ]
 fi
 
 export MKV_RENDER_URL MKV_SYNC_KEY MKV_MONGODB_URI MKV_DATA_DIR MKV_DISCOVERY
-# proot has no display: headless is mandatory on the phone (overridable in ~/mkv.env)
-export MKV_HEADLESS="${MKV_HEADLESS:-true}"
-# Firefox sandboxes use syscalls proot cannot serve -> disable them (headless one-shot
-# scraping does not rely on them; standard Termux/proot practice)
+# Under xvfb-run, DISPLAY is set — headed Camoufox clears Turnstile far more
+# reliably than headless. Override with MKV_FORCE_HEADLESS=1 if needed.
+if [ -n "${DISPLAY:-}" ] && [ "${MKV_FORCE_HEADLESS:-}" != "1" ]; then
+  export MKV_HEADLESS=false
+else
+  export MKV_HEADLESS="${MKV_HEADLESS:-true}"
+fi
+# Firefox sandboxes use syscalls proot cannot serve -> disable them (standard
+# Termux/proot practice)
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_RDD_SANDBOX=1
 export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
 mkdir -p "${MKV_DATA_DIR:-$HOME/mkvdata}"
+echo "[phone] MKV_HEADLESS=$MKV_HEADLESS DISPLAY=${DISPLAY:-none}"
 
 # wake lock if Termux provides it (inside proot it usually does not; harmless)
 command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true

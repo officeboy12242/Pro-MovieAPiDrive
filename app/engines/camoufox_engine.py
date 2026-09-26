@@ -80,32 +80,50 @@ class CamoufoxEngine(BaseEngine):
     def _cookies(self) -> dict[str, str]:
         return {c["name"]: c["value"] for c in self._ctx.cookies()}
 
-    def _wait_through_challenge(self, timeout_s: int, want_json: bool = False) -> str:
-        """Poll for real content. Handles: challenge -> Turnstile auto-solve ->
-        reload -> target page. Optional response capture is armed separately."""
+    def _has_cf(self) -> bool:
+        return "cf_clearance" in self._cookies()
+
+    def _has_mkv(self) -> bool:
+        c = self._cookies()
+        return all(k in c for k in ("mkv_client_key", "mkv_challenge", "mkv_seq"))
+
+    def _wait_through_challenge(self, timeout_s: int, want_json: bool = False,
+                                need_mkv: bool = False) -> str:
+        """Poll until real content (and optionally mkv_* cookies). Do NOT treat
+        'HTML no longer looks like a challenge' as success — CF often leaves a
+        blank/success shell with only cf_chl_* cookies and no clearance."""
         page = self._ensure()
         deadline = time.time() + timeout_s
         reloaded = False
+        last_click = 0.0
         html = ""
         while time.time() < deadline:
-            time.sleep(0.3)
+            time.sleep(0.4)
             try:
                 html = page.content()
             except Exception:
                 html = ""
-            if html.strip() and not looks_like_challenge(html[:1200]):
+            ck = self._cookies()
+            has_cf = "cf_clearance" in ck
+            has_mkv = all(k in ck for k in ("mkv_client_key", "mkv_challenge", "mkv_seq"))
+            self._set_phase(f"challenge cf={int(has_cf)} mkv={int(has_mkv)}")
+            if need_mkv and has_mkv:
+                return html
+            if not need_mkv and html.strip() and not looks_like_challenge(html[:1200]):
                 if not want_json or "{" in html[:300]:
                     return html
-            cleared = any(c["name"] == "cf_clearance" for c in self._ctx.cookies())
-            if cleared and not reloaded and time.time() + 4 < deadline:
+            if has_cf and not reloaded and time.time() + 4 < deadline:
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=30000)
                     reloaded = True
                     continue
                 except Exception:
                     pass
-            if looks_like_challenge(html[:1200]) and timeout_s - (deadline - time.time()) > 20:
-                self._click_turnstile()
+            # poke Turnstile every ~8s (auto-solve often needs a click under Xvfb)
+            if time.time() - last_click > 8 and (
+                    looks_like_challenge(html[:1200]) or not has_cf):
+                if self._click_turnstile():
+                    last_click = time.time()
         return html
 
     def _click_turnstile(self) -> bool:
@@ -114,24 +132,51 @@ class CamoufoxEngine(BaseEngine):
             page.wait_for_selector("iframe[src*='challenges.cloudflare.com']", timeout=3000)
             box = page.frame_locator("iframe[src*='challenges.cloudflare.com']")
             box.locator("input[type='checkbox'], .ctp-checkbox-label").first.click(timeout=3000)
-            time.sleep(3)
+            time.sleep(2)
             return True
         except Exception:
             return False
 
     def get_session(self, url: str, timeout_s: int = 90) -> Session:
+        """Navigate until mkv_* cookies exist. Site root first (Turnstile clears
+        more reliably on HTML), then the API URL to harvest mkv_* cookies."""
         page = self._ensure()
+        deadline = time.time() + timeout_s
+        base = url.split("/api/")[0] if "/api/" in url else url.rstrip("/")
+        # 1) clear CF on the HTML front door
         self._set_phase("goto")
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
+        try:
+            page.goto(base + "/", wait_until="domcontentloaded",
+                      timeout=min(90, timeout_s) * 1000)
+        except Exception:
+            pass
         self._set_phase("challenge")
-        self._wait_through_challenge(timeout_s, want_json=False)
+        remain = max(15, int(deadline - time.time()))
+        self._wait_through_challenge(remain, need_mkv=False)
+        # 2) hit the API endpoint so Set-Cookie issues mkv_*
+        if not self._has_mkv() and time.time() < deadline:
+            self._set_phase("goto-api")
+            try:
+                page.goto(url, wait_until="domcontentloaded",
+                          timeout=min(60, max(10, int(deadline - time.time()))) * 1000)
+            except Exception:
+                pass
+            remain = max(10, int(deadline - time.time()))
+            self._wait_through_challenge(remain, need_mkv=True)
+        # 3) one more reload if we have cf_clearance but still no mkv_*
+        if self._has_cf() and not self._has_mkv() and time.time() < deadline:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
+            except Exception:
+                pass
         self._set_phase("done")
         return Session(cookies=self._cookies(), user_agent=page.evaluate("navigator.userAgent"))
 
     def fetch(self, url: str, timeout_s: int = 90) -> tuple[str, Session]:
         page = self._ensure()
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)
-        html = self._wait_through_challenge(timeout_s, want_json=True)
+        html = self._wait_through_challenge(timeout_s, want_json=True, need_mkv=False)
         return html, Session(cookies=self._cookies(), user_agent=page.evaluate("navigator.userAgent"))
 
     # ------------------------------------------------------------------ fast path
