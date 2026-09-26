@@ -228,15 +228,51 @@ class MkvbaseClient:
             self._persist_session()
         return s
 
+    def _bootstrap_nokey(self) -> bool:
+        """Residential/mobile IPs are often never challenged by Cloudflare: a bare
+        /api/links over curl_cffi then sets every mkv_* cookie with no browser at
+        all. Costs one request; harmless (403/challenge page) when the IP IS
+        challenged. This is what makes a phone fully PC-independent."""
+        try:
+            from curl_cffi import requests as cffi
+        except ImportError:
+            return False
+        try:
+            r = cffi.get(f"{self.base}/api/links",
+                         headers={"User-Agent": _DEFAULT_UA, "Accept": "*/*",
+                                  "Accept-Language": "en-US,en;q=0.9",
+                                  "X-Requested-With": "XMLHttpRequest",
+                                  "Referer": f"{self.base}/"},
+                         timeout=25, impersonate="firefox133", allow_redirects=True)
+        except Exception:
+            return False
+        if r.status_code != 200:
+            return False
+        try:
+            cookies = {str(k): str(v) for k, v in r.cookies.items() if v}
+        except Exception:
+            cookies = {}
+        s = Session(cookies=cookies, user_agent=_DEFAULT_UA)
+        if not s.has_mkv_session():
+            return False
+        with self._lock:
+            self._session = s
+        self._persist_session()
+        return True
+
     def ensure_session(self, timeout_s: int | None = None) -> bool:
         """Engine thread only. Make the session usable, cheapest way first:
         already valid -> renew mkv_* over plain HTTP -> borrow a shared session
-        from Mongo (another host's fresh clearance) -> browser clearance.
+        from Mongo (another host's fresh clearance) -> no-browser bootstrap on a
+        friendly IP -> browser clearance (last resort).
         Returns whether the plain-HTTP path works (False = only the browser does)."""
         if self.session_ready() or self._renew_http() or self._bootstrap_http():
             self.http_verified = True
             return True
         if self._refresh_from_shared() and (self.session_ready() or self._renew_http()):
+            self.http_verified = True
+            return True
+        if self._bootstrap_nokey():
             self.http_verified = True
             return True
         try:
