@@ -98,8 +98,15 @@ class Pusher:
         self.seen.terms[_RECENT_MARK] = time.time()
         self.seen.save()
         links = resp.get("links") or {}
+        total = links.get("total")
+        if not total:  # tolerate older API without links stats
+            try:
+                with urllib.request.urlopen(f"{self.render}/health", timeout=30) as r:
+                    total = (json.loads(r.read() or b"{}").get("links") or {}).get("rows")
+            except Exception:
+                pass
         return (f"recent: pushed {len(rows)} rows -> new {links.get('new', '?')} "
-                f"updated {links.get('updated', '?')} total {links.get('total', '?')}")
+                f"updated {links.get('updated', '?')} total {total if total is not None else '?'}")
 
     # ------------------------------------------------------------------ search loop
     def add_terms(self, terms: list[str]) -> None:

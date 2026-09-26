@@ -12,6 +12,7 @@ tmp = tempfile.mkdtemp()
 os.environ["MKV_DATA_DIR"] = tmp
 os.environ["MKV_SERVE_ONLY"] = "1"
 os.environ["MKV_SYNC_KEY"] = "testkey123"
+os.environ["MKV_INDEX"] = "file"  # deterministic file backend for this test
 
 from fastapi.testclient import TestClient  # noqa: E402
 

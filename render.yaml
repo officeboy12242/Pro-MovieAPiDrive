@@ -23,6 +23,11 @@ services:
       # Set in the Render dashboard (same value on the pusher). Never in git.
       - key: MKV_SYNC_KEY
         sync: false
+      # MongoDB Atlas connection string (durable links index across redeploys).
+      # Set the real value in the Render dashboard, never in git. Locally the
+      # pusher/API reads gitignored data/mongo_uri.txt.
+      - key: MKV_MONGODB_URI
+        sync: false
       - key: MKV_CACHE_TTL
         value: "300"        # synced terms served instantly
       - key: MKV_KEEPALIVE

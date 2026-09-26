@@ -15,6 +15,50 @@ import time
 _KEYS = ("id", "url", "title")
 
 
+def _row_key(row: dict) -> str | None:
+    """Stable dedup key for a link row: id -> url -> title."""
+    for k in _KEYS:
+        v = row.get(k)
+        if v not in (None, ""):
+            return f"{k}:{str(v).strip().lower()}"
+    return None
+
+
+def _mongo_uri() -> str | None:
+    """MongoDB connection string: MKV_MONGODB_URI env, else data/mongo_uri.txt
+    (gitignored) for local runs. None when not configured -> file-backed index."""
+    uri = os.getenv("MKV_MONGODB_URI", "")
+    if not uri:
+        try:
+            p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "data", "mongo_uri.txt")
+            uri = open(p, encoding="utf-8").read().strip()
+        except OSError:
+            return None
+    return uri or None
+
+
+def make_index(data_dir: str):
+    """Links index backend selector. MKV_INDEX=mongo (or a Mongo URI present)
+    -> MongoDB Atlas, durable across redeploys and sleeps; otherwise the
+    file-backed LinksIndex in data_dir. Both satisfy the same interface:
+    upsert(rows, source) -> (new, updated), recent(limit, q) -> {count, results},
+    stats() -> {rows, ...}."""
+    if os.getenv("MKV_INDEX", "").lower() == "file":
+        return LinksIndex(data_dir)
+    uri = _mongo_uri()
+    if uri:
+        try:
+            idx = MongoIndex(uri)
+            idx.stats()  # fail fast at boot, fall back to file if unreachable
+            print("[index] MongoDB backend (durable across redeploys)", flush=True)
+            return idx
+        except Exception as e:
+            print(f"[index] MongoDB unreachable ({type(e).__name__}: {e}); "
+                  "falling back to file index", flush=True)
+    return LinksIndex(data_dir)
+
+
 class Store:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
@@ -176,3 +220,83 @@ class LinksIndex:
         with self._lock:
             return {"rows": len(self._rows), "max_rows": self.MAX_ROWS,
                     "file": os.path.basename(self.path), "served": self._hits}
+
+
+class MongoIndex:
+    """Links index backed by MongoDB Atlas — durable across Render redeploys,
+    sleeps and restarts. One document per link row, deduplicated on _id (the
+    row key: id/url/title) via upserts; queries are single-index sorts.
+
+    db/collection: MKV_MONGO_DB (default mkvbase) / links.
+    """
+
+    def __init__(self, uri: str, db: str | None = None):
+        from pymongo import DESCENDING, MongoClient
+        self._DESC = DESCENDING
+        self._client = MongoClient(uri, serverSelectionTimeoutMS=8000,
+                                   socketTimeoutMS=20000, maxPoolSize=4)
+        self._col = self._client[db or os.getenv("MKV_MONGO_DB", "mkvbase")].links
+        self._col.create_index("_seq")  # first-seen order, for newest-first paging
+        self._hits = 0
+
+    @staticmethod
+    def _doc(row: dict, source: str, seq: float) -> dict:
+        # NOTE: no _id here — it is immutable in $set; upsert inserts take it
+        # from the equality filter instead.
+        doc = {k: row[k] for k in ("id", "title", "url", "created_at", "status")
+               if row.get(k) is not None}
+        if source:
+            doc["_src"] = source
+        doc["_seq"] = seq
+        return doc
+
+    def upsert(self, rows: list[dict], source: str = "") -> tuple[int, int]:
+        """Merge rows by key; returns (rows_new, rows_updated). One bulk op per call."""
+        from pymongo import UpdateOne
+        ops, new, updated, now = [], 0, 0, time.time()
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            key = _row_key(row)
+            if key is None:
+                continue
+            ops.append(UpdateOne(
+                {"_id": key},
+                [{"$set": {**self._doc(row, source, now),
+                           "_seq": {"$ifNull": ["$_seq", now]},  # keep first-seen order
+                           "_upd": now}}],
+                upsert=True))
+        if not ops:
+            return 0, 0
+        try:
+            res = self._col.bulk_write(ops, ordered=False)
+            new, updated = res.upserted_count, res.modified_count
+        except Exception:
+            # bulk_write counts can be off with retries; make the return exact
+            new, updated = 0, 0
+            for op in ops:
+                before = self._col.find_one({"_id": op._filter["_id"]}, {"_id": 1})
+                res = self._col.update_one(op._filter, op._document[0], upsert=True)
+                if res.upserted_count:
+                    new += 1
+                elif before is not None and res.modified_count:
+                    updated += 1
+        return new, updated
+
+    def recent(self, limit: int = 50, q: str | None = None) -> dict:
+        """Newest-discovered-first rows, optional case-insensitive substring on
+        title/url (regex-escaped)."""
+        import re as _re
+        self._hits += 1
+        query = ({"$or": [{"title": {"$regex": _re.escape(q), "$options": "i"}},
+                          {"url": {"$regex": _re.escape(q), "$options": "i"}}]}
+                 if q else {})
+        total = self._col.count_documents(query)
+        rows = list(self._col.find(query, {"_id": 0, "_seq": 0, "_upd": 0})
+                    .sort("_seq", self._DESC).limit(max(0, limit)))
+        return {"count": total, "results": rows}
+
+    def stats(self) -> dict:
+        return {"rows": self._col.estimated_document_count(),
+                "backend": "mongodb", "db": self._col.database.name,
+                "served": self._hits}

@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from .client import MkvbaseClient, MkvbaseError, NeedsSession
 from .engines import make_engine
 from .keepalive import start_keepalive
-from .store import LinksIndex, Store
+from .store import Store, make_index
 
 app = FastAPI(title="mkvbase-cf-api", version="1.3.1")
 _BOOT = time.time()
@@ -40,8 +40,10 @@ _DATA_DIR = os.getenv("MKV_DATA_DIR", os.path.join(os.path.dirname(__file__), ".
 _REQUEST_WAIT_S = float(os.getenv("MKV_REQUEST_WAIT", "25"))
 
 # Deduplicated, persistent index of every link row ever seen (synced or scraped).
-# Serves GET /links and the serve-only /recent; rows merge by id/url/title.
-_links_index = LinksIndex(_DATA_DIR)
+# Backend: MongoDB Atlas when MKV_MONGODB_URI is set (durable across redeploys and
+# sleeps), else a JSON file under MKV_DATA_DIR. Serves GET /links and serve-only
+# /recent and /search.
+_links_index = make_index(_DATA_DIR)
 # Hard ceiling on one warm attempt. Past it the browser is killed and the engine
 # thread replaced, so a wedged browser can never block the warmer forever.
 _WARM_TIMEOUT_S = float(os.getenv("MKV_WARM_TIMEOUT", "300"))
@@ -389,6 +391,17 @@ def search(term: str = Query(..., min_length=1, max_length=100),
             "results": obj.get("results", []),
         }
     if _SERVE_ONLY:
+        hit = _cache_get(term)
+        if hit is not None:
+            obj, age = hit
+            return {"term": term, "count": obj.get("count"), "difficulty": obj.get("difficulty"),
+                    "engine": obj.get("_engine"), "cached": True, "age_s": round(age, 1),
+                    "took_ms": int((time.time() - t0) * 1000), "results": obj.get("results", [])}
+        rows = _links_index.recent(limit=1000, q=term)["results"]
+        if rows:
+            return {"term": term, "count": len(rows), "difficulty": None,
+                    "engine": "links-index", "cached": True, "source": "links_index",
+                    "took_ms": int((time.time() - t0) * 1000), "results": rows}
         stale = _stale("search", term)
         if stale is None:
             raise HTTPException(status_code=404, detail="term not synced (serve-only mode)")
