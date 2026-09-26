@@ -248,6 +248,7 @@ class Pusher:
         self.disc = self.start_discovery()  # no-op unless MKV_DISCOVERY/--discover
         while True:
             now = time.monotonic()
+            disc = self.disc
             if now >= next_heartbeat:
                 up = int(time.time() - started)
                 disc_bit = ""
@@ -259,7 +260,6 @@ class Pusher:
                       f"watched_terms={max(0, len(self.seen.terms) - 1)}{disc_bit}",
                       flush=True)
                 next_heartbeat = now + 60
-            disc = self.disc
             if disc is not None and now >= next_trending:
                 # what real users are searching right now -> high-yield crawl seeds
                 try:
