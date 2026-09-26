@@ -162,10 +162,23 @@ class Discovery:
         t0 = time.time()
         try:
             obj = self.client.search(term)
-        except MkvbaseError as e:
-            self.known_terms.add(term)  # retire the term; do not retry forever
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:120]}"
+            transient = any(s in err.lower() for s in (
+                "timeout", "needssession", "clearance", "target closed",
+                "connection", "network", "browser cannot launch"))
+            if transient:
+                # put it back at the end — do not burn a seed on a flaky clear
+                if term not in self.queued_set and term not in self.known_terms:
+                    self.queued.append(term)
+                    self.queued_set.add(term)
+                self.save()
+                return {"status": "retry", "term": term, "err": err,
+                        "took_s": round(time.time() - t0, 1),
+                        "queued": len(self.queued)}
+            self.known_terms.add(term)  # permanent fail — retire
             self.save()
-            return {"status": "fail", "term": term, "err": str(e)[:90],
+            return {"status": "fail", "term": term, "err": err,
                     "took_s": round(time.time() - t0, 1)}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
         mined = self._mine([r.get("title") or "" for r in rows])
@@ -189,6 +202,9 @@ class Discovery:
             return (f"[discovery] ok {term!r}: {info.get('rows', 0)} rows, "
                     f"{info.get('new', 0)} new, mined {info.get('mined', 0)} words "
                     f"→ queue {info.get('queued', 0)}  ({took}s)  [{self.stats_line()}]")
+        if info.get("status") == "retry":
+            return (f"[discovery] RETRY {term!r} later: {info.get('err', '?')}  "
+                    f"({took}s)  [{self.stats_line()}]")
         if info.get("status") == "fail":
             return (f"[discovery] FAIL {term!r}: {info.get('err', '?')}  ({took}s)  "
                     f"[{self.stats_line()}]")
@@ -198,6 +214,14 @@ class Discovery:
     def run(self, log=print) -> None:
         """Polite forever-loop: bounded passes, cooldown when saturated,
         exhausted terms re-checked after each cooldown."""
+        # wait for the pusher's upfront CF clear so we don't race Camoufox
+        for i in range(36):  # up to ~3 min
+            if self.client.session_ready():
+                break
+            if i == 0:
+                log("[discovery] waiting for Cloudflare session before first crawl…",
+                    flush=True)
+            time.sleep(5)
         log(f"[discovery] start: {len(self.queued)} queued, {self.done_terms} done, "
             f"{len(self.exhausted)} exhausted, gap {self.gap_s:.0f}s between searches",
             flush=True)
@@ -215,8 +239,9 @@ class Discovery:
                 if info.get("status") == "ok":
                     pass_new += info.get("new", 0)
                 log(self._fmt_step(info), flush=True)
-                # tick during politeness gap so Termux isn't a silent black screen
-                left = int(self.gap_s)
+                # longer pause after a transient fail so CF/browser can recover
+                gap = int(self.gap_s) * (2 if info.get("status") == "retry" else 1)
+                left = gap
                 while left > 0:
                     log(f"[discovery] next crawl in {left}s…  [{self.stats_line()}]",
                         flush=True)
