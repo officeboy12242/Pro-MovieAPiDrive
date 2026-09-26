@@ -1,10 +1,10 @@
-"""Discovery crawler — walk mkvbase's back catalog into the links index.
+"""Discovery crawler -- walk mkvbase's back catalog into the links index.
 
 mkvbase exposes no bulk API and no pagination (verified against the live site):
 the only enumeration primitive is signed search, which returns up to 50 matches
 per term. Discovery exploits it with a term waterfall:
 
-  1. SEEDS — years ("2019"), single letters and digits (cover most title
+  1. SEEDS -- years ("2019"), single letters and digits (cover most title
      starts), quality tags, languages, common title words.
   2. Every search returns up to 50 titles; each unknown word in each title is
      queued as the next term. Productive terms stay alive, dry ones retire.
@@ -18,7 +18,7 @@ crawler cools down, re-queues previously exhausted terms for a re-check (new
 uploads make some productive again), and repeats. New uploads also surface
 continuously through the recent loop regardless.
 
-Politeness: one search every MKV_DISCOVERY_GAP_S seconds (default 45) — the
+Politeness: one search every MKV_DISCOVERY_GAP_S seconds (default 45) -- the
 same rate a curious human with a search box would produce.
 """
 from __future__ import annotations
@@ -66,7 +66,7 @@ class Discovery:
 
     def __init__(self, client: MkvbaseClient, index, state_dir: str):
         self.client = client
-        self.index = index  # MongoIndex (preferred) — needs upsert(rows, source)
+        self.index = index  # MongoIndex (preferred) -- needs upsert(rows, source)
         self._qlock = threading.Lock()  # queue is fed by pusher threads too
         self.state_path = os.path.join(state_dir, "discovery_state.json")
         self.gap_s = float(os.getenv("MKV_DISCOVERY_GAP_S", "45"))
@@ -128,7 +128,7 @@ class Discovery:
 
     def seed_titles(self, titles: list[str], front: bool = False) -> int:
         """External seeds. front=True (words mined from the newest recent rows)
-        jumps the queue so the freshest uploads' vocabulary is searched next —
+        jumps the queue so the freshest uploads' vocabulary is searched next --
         approximating a created_at walk backwards. front=False for /api/trending
         and other steady-state seeds."""
         added = 0
@@ -178,7 +178,7 @@ class Discovery:
                 "timeout", "needssession", "clearance", "target closed",
                 "connection", "network", "browser cannot launch"))
             if transient:
-                # put it back at the end — do not burn a seed on a flaky clear
+                # put it back at the end -- do not burn a seed on a flaky clear
                 if term not in self.queued_set and term not in self.known_terms:
                     self.queued.append(term)
                     self.queued_set.add(term)
@@ -186,7 +186,7 @@ class Discovery:
                 return {"status": "retry", "term": term, "err": err,
                         "took_s": round(time.time() - t0, 1),
                         "queued": len(self.queued)}
-            self.known_terms.add(term)  # permanent fail — retire
+            self.known_terms.add(term)  # permanent fail -- retire
             self.save()
             return {"status": "fail", "term": term, "err": err,
                     "took_s": round(time.time() - t0, 1)}
@@ -211,7 +211,7 @@ class Discovery:
         if info.get("status") == "ok":
             return (f"[discovery] ok {term!r}: {info.get('rows', 0)} rows, "
                     f"{info.get('new', 0)} new, mined {info.get('mined', 0)} words "
-                    f"→ queue {info.get('queued', 0)}  ({took}s)  [{self.stats_line()}]")
+                    f"-> queue {info.get('queued', 0)}  ({took}s)  [{self.stats_line()}]")
         if info.get("status") == "retry":
             return (f"[discovery] RETRY {term!r} later: {info.get('err', '?')}  "
                     f"({took}s)  [{self.stats_line()}]")
@@ -229,7 +229,7 @@ class Discovery:
             if self.client.session_ready():
                 break
             if i == 0:
-                log("[discovery] waiting for Cloudflare session before first crawl…",
+                log("[discovery] waiting for Cloudflare session before first crawl...",
                     flush=True)
             time.sleep(5)
         log(f"[discovery] start: {len(self.queued)} queued, {self.done_terms} done, "
@@ -253,7 +253,7 @@ class Discovery:
                 gap = int(self.gap_s) * (2 if info.get("status") == "retry" else 1)
                 left = gap
                 while left > 0:
-                    log(f"[discovery] next crawl in {left}s…  [{self.stats_line()}]",
+                    log(f"[discovery] next crawl in {left}s...  [{self.stats_line()}]",
                         flush=True)
                     chunk = min(15, left)
                     time.sleep(chunk)
@@ -268,18 +268,18 @@ class Discovery:
                     if self._queue(t):
                         revived += 1
                 cool = int(self.cool_down_s)
-                log(f"[discovery] saturated — cooling {cool // 60} min, "
+                log(f"[discovery] saturated -- cooling {cool // 60} min, "
                     f"re-queued {revived} old terms "
                     "(recent loop keeps updating meanwhile)", flush=True)
                 left = cool
                 while left > 0:
-                    log(f"[discovery] cooldown {left // 60}m {left % 60}s left…  "
+                    log(f"[discovery] cooldown {left // 60}m {left % 60}s left...  "
                         f"[{self.stats_line()}]", flush=True)
                     chunk = min(60, left)
                     time.sleep(chunk)
                     left -= chunk
             elif not self.queued:
-                log("[discovery] queue drained — reseeding for another sweep", flush=True)
+                log("[discovery] queue drained -- reseeding for another sweep", flush=True)
                 for t in _SEEDS:
                     self.known_terms.discard(t)  # allow re-search of seeds
                     self._queue(t)
