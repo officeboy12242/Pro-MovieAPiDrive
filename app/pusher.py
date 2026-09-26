@@ -86,11 +86,11 @@ class Pusher:
             return json.loads(r.read() or b"{}")
 
     # ------------------------------------------------------------------ recent loop
-    def poll_recent_once(self) -> str:
+    def poll_recent_once(self, force: bool = False) -> str:
         obj = self.client.recent()
         rows = obj.get("results") or []
         ids = {r.get("id") for r in rows if isinstance(r, dict)}
-        if ids and ids == self.seen.recent_ids and not self.force_recent:
+        if ids and ids == self.seen.recent_ids and not (self.force_recent or force):
             return f"recent: {len(rows)} rows unchanged, skipped POST"
         resp = self._push({"kind": "links", "term": "latest", "count": len(rows),
                            "results": rows})
@@ -149,11 +149,15 @@ class Pusher:
               f"(first scrape clears Cloudflare — may take a minute)", flush=True)
         next_recent = 0.0
         next_search_tick = 0.0
+        first_poll = True
         while True:
             now = time.monotonic()
             if now >= next_recent:
+                # The first poll always POSTs: a fresh/empty backend (new Mongo
+                # collection, wiped /tmp) gets repopulated on pusher start.
                 try:
-                    print(f"[pusher] {self.poll_recent_once()}", flush=True)
+                    print(f"[pusher] {self.poll_recent_once(force=first_poll)}", flush=True)
+                    first_poll = False
                     next_recent = now + self.recent_every
                 except Exception as e:
                     print(f"[pusher] recent poll failed: {type(e).__name__}: {str(e)[:160]}",
