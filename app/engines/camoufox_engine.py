@@ -9,7 +9,7 @@ import os
 import time
 import urllib.parse
 
-from .base import BaseEngine, Session, looks_like_challenge
+from .base import BaseEngine, Session, check_launch_ram, looks_like_challenge
 
 # Firefox single-process mode (MOZ_FORCE_DISABLE_E10S) makes Playwright's new_page()
 # hang forever (verified: launch + new_context fine, new_page never returns). Keep
@@ -48,6 +48,7 @@ class CamoufoxEngine(BaseEngine):
     def _ensure(self):
         if self._page is not None:
             return self._page
+        check_launch_ram()
         from camoufox.sync_api import Camoufox
         kwargs = {"headless": self.headless,
                   "env": {k: v for k, v in os.environ.items() if k not in _DROP_ENV}}

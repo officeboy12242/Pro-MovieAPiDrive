@@ -19,13 +19,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from .client import MkvbaseClient, MkvbaseError, NeedsSession
 from .engines import make_engine
 from .keepalive import start_keepalive
-from .store import Store
+from .store import LinksIndex, Store
 
 app = FastAPI(title="mkvbase-cf-api", version="1.3.1")
 _BOOT = time.time()
@@ -38,6 +38,10 @@ _SERVE_ONLY = os.getenv("MKV_SERVE_ONLY", "").lower() in ("1", "true", "yes")
 _DATA_DIR = os.getenv("MKV_DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
 # Longest a request waits for the warmer before answering from stale data or 503.
 _REQUEST_WAIT_S = float(os.getenv("MKV_REQUEST_WAIT", "25"))
+
+# Deduplicated, persistent index of every link row ever seen (synced or scraped).
+# Serves GET /links and the serve-only /recent; rows merge by id/url/title.
+_links_index = LinksIndex(_DATA_DIR)
 # Hard ceiling on one warm attempt. Past it the browser is killed and the engine
 # thread replaced, so a wedged browser can never block the warmer forever.
 _WARM_TIMEOUT_S = float(os.getenv("MKV_WARM_TIMEOUT", "300"))
@@ -335,6 +339,7 @@ def health():
             "proxy": bool(os.getenv("MKV_PROXY")),
             "origin_key": bool(os.getenv("MKV_ORIGIN_KEY")),
             "serve_only": _SERVE_ONLY,
+            "links": _links_index.stats(),
             "bootstrap_timeout_s": _client._bootstrap_timeout if _client else None,
             "cache": {"entries": len(_cache), "hits": _cache_hits, "misses": _cache_misses,
                       "ttl_s": _CACHE_TTL_S},
@@ -342,11 +347,16 @@ def health():
 
 
 @app.post("/sync")
-def sync(payload: dict, x_sync_key: str | None = None):
-    """Split-plane ingest: a scraper elsewhere (home PC) pushes full result objects.
+def sync(payload: dict, x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+         legacy_key: str | None = Query(default=None, alias="x_sync_key")):
+    """Split-plane ingest: a scraper elsewhere (home PC, phone) pushes full result objects.
     Body: {"term": str, "results": [...], "count": int, ...} — the same shape
-    client.search() produces. Guarded by MKV_SYNC_KEY when set."""
-    if _SYNC_KEY and x_sync_key != _SYNC_KEY:
+    client.search() produces. Key via the X-Sync-Key header (or legacy ?x_sync_key=).
+    Guarded by MKV_SYNC_KEY when set. Rows are merged into the deduplicated links
+    index (id/url/title), so repeated pushes of overlapping data never create
+    duplicates.
+    """
+    if _SYNC_KEY and _SYNC_KEY not in (x_sync_key, legacy_key):
         raise HTTPException(status_code=401, detail="bad sync key")
     term = (payload.get("term") or payload.get("_term") or "").strip()
     if not term:
@@ -355,10 +365,13 @@ def sync(payload: dict, x_sync_key: str | None = None):
     obj["_source"] = "sync"
     obj["_synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _cache_put(term, obj)  # serves /search instantly; lives as long as the process
+    new, updated = _links_index.upsert(obj.get("results") or [], source="sync")
     if obj.get("results"):
         Store(_DATA_DIR).record("search", term, obj)
     return {"ok": True, "term": term, "count": obj.get("count"),
-            "cached": True, "cache_entries": len(_cache)}
+            "cached": True, "cache_entries": len(_cache),
+            "links": {"new": new, "updated": updated,
+                      "total": _links_index.stats()["rows"]}}
 
 
 @app.get("/search")
@@ -395,6 +408,7 @@ def search(term: str = Query(..., min_length=1, max_length=100),
                 "reason": str(e)[:200], "warmer": _warmer.state,
                 "took_ms": int((time.time() - t0) * 1000), "results": obj.get("results", [])}
     _cache_put(term, obj)
+    _links_index.upsert(obj.get("results") or [], source="search")
     path = Store(_DATA_DIR).record("search", term, obj) if save else None
     return {
         "term": term, "count": obj.get("count"), "difficulty": obj.get("difficulty"),
@@ -404,9 +418,21 @@ def search(term: str = Query(..., min_length=1, max_length=100),
     }
 
 
+@app.get("/links")
+def links(limit: int = Query(50, ge=1, le=1000), q: str | None = Query(None)):
+    """Every unique link row ever synced/scraped, newest first, deduplicated by
+    id/url/title. Optional ?q= substring filter on title/url."""
+    out = _links_index.recent(limit=limit, q=q)
+    return {"total": _links_index.stats()["rows"], **out}
+
+
 @app.get("/recent")
 def recent(save: bool = True):
     if _SERVE_ONLY:
+        out = _links_index.recent(limit=50)
+        if out["results"]:
+            return {**out, "cached": True, "source": "links_index",
+                    "took_ms": 0}
         stale = _stale("recent", "latest")
         if stale is None:
             raise HTTPException(status_code=404, detail="no recent snapshot (serve-only mode)")
@@ -417,6 +443,7 @@ def recent(save: bool = True):
     except Exception as e:
         obj, age = _unavailable("recent", "latest", e)
         return {**obj, "stale": True, "age_s": round(age, 1), "reason": str(e)[:200]}
+    _links_index.upsert(obj.get("results") or [], source="recent")
     if save:
         Store(_DATA_DIR).record("recent", "latest", obj)
     return obj

@@ -8,8 +8,44 @@ Fast paths (optional overrides):
 """
 from __future__ import annotations
 
+import os
 import time
 from abc import ABC, abstractmethod
+
+
+def check_launch_ram() -> None:
+    """Refuse to launch a browser when the container's memory ceiling cannot fit one
+    (Render free = 512MB; Firefox wants ~1.5-2GB). On such hosts the launch does not
+    crash cleanly — it wedges at new_page for minutes, holds ~370MB, and gets
+    OOM-killed, every attempt. Fail in milliseconds instead, with the fix in the
+    message. No cgroup limit (desktop, phone, most VMs) -> no-op.
+    """
+    if os.getenv("MKV_ALLOW_BROWSER_ANYWAY", "").lower() in ("1", "true", "yes"):
+        return
+    try:
+        floor = float(os.getenv("MKV_MIN_LAUNCH_MEM_MB", "700") or 0)
+    except ValueError:
+        floor = 700.0
+    if floor <= 0:
+        return
+    limit_mb: float | None = None
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(p) as f:
+                v = f.read().strip()
+            if v and v != "max":
+                limit_mb = int(v) / 2 ** 20
+            break
+        except OSError:
+            continue
+    if limit_mb is None or limit_mb >= floor:
+        return
+    raise RuntimeError(
+        f"browser cannot launch: container memory limit {limit_mb:.0f}MB < ~{floor:.0f}MB Firefox needs; "
+        "launches wedge at new_page and are OOM-killed. On Render free use a browser-free mode instead: "
+        "MKV_ORIGIN_KEY (owner Cloudflare skip-rule header -> live scraping, no browser) or "
+        "MKV_SERVE_ONLY=true (serve results pushed via POST /sync from another host). "
+        "Or upgrade the plan / use a 1GB+ host. Override with MKV_ALLOW_BROWSER_ANYWAY=true.")
 
 
 class Session:

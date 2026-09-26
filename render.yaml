@@ -1,10 +1,13 @@
-# Render Blueprint — free plan variant
-# NOTE: free plan = 512MB RAM, 0.1 CPU. Camoufox is memory-tuned with Firefox prefs
-# (one content process, no fission; MKV_LEAN_BROWSER) + MALLOC_ARENA_MAX=2, and the
-# browser is closed right after Cloudflare clears (MKV_RELEASE_BROWSER): searches
-# then run over plain HTTP, so RAM stays low between clearances.
-# Keepalive is ON: it pings the public URL so the instance (and its warm session)
-# does not sleep. /tmp is wiped on every sleep/restart, forcing a new clearance.
+# Render Blueprint — free plan variant, serve-only split-plane
+# NOTE: free plan = 512MB RAM, 0.1 CPU. Measured live: Firefox wedges at the
+# new_page phase here and is OOM-killed every attempt (mem ~370MB / 512MB, then
+# "warm attempt exceeded 300s, stuck at browser phase 'new_page'"). The browser
+# path cannot run on this plan, so this blueprint is SERVE-ONLY: a stronger host
+# (home PC, or Android in Termux+proot — see README "Split-plane") scrapes
+# mkvbase and pushes results via POST /sync; this instance serves them with no
+# browser. A launch guard (app/engines/base.py check_launch_ram) fails fast with
+# an explanation if a browser is ever attempted below ~700MB.
+# Keepalive is ON: it pings the public URL so the instance does not sleep.
 services:
   - type: web
     name: pro-movieapidrive
@@ -13,26 +16,30 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: MKV_SERVE_ONLY
+        value: "true"       # no browser, no warmer: serve synced/saved data only
+      - key: MKV_DATA_DIR
+        value: /tmp/data
+      # Set in the Render dashboard (same value on the pusher). Never in git.
+      - key: MKV_SYNC_KEY
+        sync: false
+      - key: MKV_CACHE_TTL
+        value: "300"        # synced terms served instantly
+      - key: MKV_KEEPALIVE
+        value: "true"
+      # --- legacy browser-path knobs; inert under serve-only, kept for quick rollback
       - key: MKV_ENGINE
         value: camoufox
       - key: MKV_HEADLESS
         value: "true"
-      - key: MKV_KEEPALIVE
-        value: "true"
-      - key: MKV_PREWARM
-        value: "true"       # warmer clears CF at boot, in the background
       - key: MKV_RELEASE_BROWSER
-        value: "true"       # close Firefox once plain HTTP is verified
+        value: "true"
       - key: MKV_REQUEST_WAIT
-        value: "25"         # max seconds a request waits for the warmer, then 503/stale
+        value: "25"
       - key: MKV_BOOTSTRAP_TIMEOUT
-        value: "150"        # 0.1 CPU: page load + challenge are slow, give them room
+        value: "150"
       - key: MKV_WARM_TIMEOUT
-        value: "420"        # hard ceiling per warm attempt, then kill browser + retry
-      - key: MKV_CACHE_TTL
-        value: "300"        # repeat searches within 5 min are served instantly
-      - key: MKV_DATA_DIR
-        value: /tmp/data
+        value: "420"
       - key: MALLOC_ARENA_MAX
         value: "2"
       # Optional: residential proxy, only if /health shows Cloudflare never clears

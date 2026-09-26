@@ -3,6 +3,79 @@
 Cloudflare-proof search API for **mkvbase.site** — the complete standalone version
 of the bypass proven live in the Freebuff browser tab.
 
+## Split-plane deployment (RECOMMENDED for Render free) ⭐
+
+Render free = 512MB / 0.1 CPU. Measured live: Firefox wedges at the `new_page`
+phase and is OOM-killed on every warm attempt (~370MB held, then `killed 4
+browser processes`), so Cloudflare can never clear there. The fix is to split
+the work across two hosts — neither needs to be paid:
+
+```
+┌─────────────────────────────┐        POST /sync         ┌──────────────────────────┐
+│ PUSHER — needs RAM only     │  ───────────────────────▶ │ RENDER — 512MB is plenty │
+│ home PC, or Android phone   │   JSON, deduplicated by   │ MKV_SERVE_ONLY=true      │
+│ (Termux+proot), 2GB+        │   id/url/title            │ serves cache+links index │
+│ clears CF once, then plain  │                           │ ~50MB RAM, no browser    │
+│ HTTP ~1s per scrape         │                           │ GET /search /recent      │
+└─────────────────────────────┘                           │ GET /links?q=&limit=     │
+                                                          └──────────────────────────┘
+```
+
+### 1. Render side (serve-only)
+
+- Deploy from `render.yaml` (already set to `MKV_SERVE_ONLY=true`).
+- Render dashboard → Environment → `MKV_SYNC_KEY=<secret>` (generate:
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+- Serve-only uses ~50MB RAM; the memory launch-guard (`check_launch_ram`)
+  fails fast with an explanation if a browser is ever attempted.
+
+### 2. Pusher side (anything with 2GB+ RAM)
+
+```bash
+# on the pusher host (same repo)
+pip install -r requirements.txt && python -m camoufox fetch
+set MKV_RENDER_URL=https://pro-movieapidrive.onrender.com
+set MKV_SYNC_KEY=<same secret as Render>
+set MKV_PUSHER_TERMS=godzilla,interstellar,predestination   # optional watch-list
+python -m app.pusher
+```
+
+Loops forever: polls recent every 2 min and POSTs **only when the id-set
+changes** (an idle site costs nothing), refreshes each watched term hourly,
+replays the backlog of previously-seen terms on cold start, and retries
+failed pushes. Every response reports `links.new / updated / total`.
+
+### 3. Android phone as the pusher (works, free, residential IP helps)
+
+Phones have 6–12GB RAM and Camoufox ships **arm64 Linux builds**, and a
+residential mobile IP clears Cloudflare more easily than any datacenter IP:
+
+1. Install [Termux](https://f-droid.org/en/packages/com.termux/) (F-Droid build).
+2. `pkg update && pkg install python git proot-distro`
+3. `proot-distro install ubuntu && proot-distro login ubuntu`
+4. Inside Ubuntu: `apt update && apt install python3-venv git && git clone <your-repo> && cd mkvbase-cf-api`
+5. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python -m camoufox fetch`
+6. `MKV_RENDER_URL=... MKV_SYNC_KEY=... .venv/bin/python -m app.pusher`
+7. Keep it alive: `termux-wake-lock` before step 6; disable battery optimization
+   for Termux. The pusher is restart-safe: `data/pusher_state.json` remembers
+   watch terms and the last recent id-set, so it resumes without re-pushing.
+
+Dedup guarantee: the receiving side keys every row by id (fallback url/title)
+and merges updates in place — overlapping pushes from multiple pushers can
+never create duplicate rows. `GET /links` returns the merged, newest-first
+index; `GET /health` → `links: {rows, ...}` shows the total.
+
+### Alternatives (if you don't want to run a pusher)
+
+- **Owner allowlist, no browser at all** — if you control mkvbase.site's
+  Cloudflare zone: WAF skip-rule for a secret header (see below), set
+  `MKV_ORIGIN_KEY` on Render, unset `MKV_SERVE_ONLY`. Live scraping on Render
+  itself, ~200MB RAM.
+- **Oracle Always Free ARM VM (up to 24GB, $0)** — `deploy/oracle-setup.sh` +
+  `deploy/oracle-push.ps1` are ready; runs the whole thing including browser.
+- **Bigger Render plan** — Standard 2GB ($25/mo) runs the browser comfortably,
+  though a datacenter IP may still be challenged harder by Cloudflare.
+
 ## How it beats Cloudflare
 
 1. A real browser engine opens `https://mkvbase.site/api/links` **top-level**.
