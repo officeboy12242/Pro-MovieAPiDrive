@@ -46,7 +46,9 @@ _STOP = {"the", "and", "for", "with", "from", "www", "com", "mkv", "dvd",
          "edition", "complete", "season", "episode", "ep", "eps", "vol",
          "chapter", "bangla", "chinese", "amzn", "netflix", "hdr10plus"}
 
-_SEEDS = [str(y) for y in range(1950, 2027)] + [
+# Fresh-first: years DESCEND (recent uploads are recent movies, so 2026->1950
+# approximates walking created_at backwards; the API itself has no date query).
+_SEEDS = [str(y) for y in range(2026, 1949, -1)] + [
     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
     "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
@@ -64,6 +66,7 @@ class Discovery:
     def __init__(self, client: MkvbaseClient, index, state_dir: str):
         self.client = client
         self.index = index  # MongoIndex (preferred) — needs upsert(rows, source)
+        self._qlock = threading.Lock()  # queue is fed by pusher threads too
         self.state_path = os.path.join(state_dir, "discovery_state.json")
         self.gap_s = float(os.getenv("MKV_DISCOVERY_GAP_S", "45"))
         self.max_word_len = int(os.getenv("MKV_DISCOVERY_MAXWORD", "24"))
@@ -108,29 +111,34 @@ class Discovery:
         except Exception:
             pass
 
-    def _queue(self, term: str, max_len: int | None = None) -> bool:
+    def _queue(self, term: str, max_len: int | None = None, front: bool = False) -> bool:
         t = term.strip().lower()
         cap = max_len or self.max_word_len
-        if (t and 3 <= len(t) <= cap and t not in self.queued_set
-                and t not in self.known_terms and t not in self.exhausted):
-            self.queued.append(t)
-            self.queued_set.add(t)
-            return True
+        with self._qlock:
+            if (t and 3 <= len(t) <= cap and t not in self.queued_set
+                    and t not in self.known_terms and t not in self.exhausted):
+                if front:
+                    self.queued.insert(0, t)  # freshness-first: freshest words first
+                else:
+                    self.queued.append(t)
+                self.queued_set.add(t)
+                return True
         return False
 
-    def seed_titles(self, titles: list[str]) -> int:
-        """High-yield external seeds (e.g. /api/trending — what real users are
-        searching right now). Queue the full title (its search returns all its
-        links at once) plus its individual words."""
+    def seed_titles(self, titles: list[str], front: bool = False) -> int:
+        """External seeds. front=True (words mined from the newest recent rows)
+        jumps the queue so the freshest uploads' vocabulary is searched next —
+        approximating a created_at walk backwards. front=False for /api/trending
+        and other steady-state seeds."""
         added = 0
         for title in titles or []:
             title = (title or "").strip()
             if not title:
                 continue
-            if self._queue(title, max_len=80):
+            if self._queue(title, max_len=80, front=front):
                 added += 1
             for w in _WORD.findall(title.lower()):
-                if w not in _STOP and self._queue(w):
+                if w not in _STOP and self._queue(w, front=front):
                     added += 1
         if added:
             self.save()
@@ -151,10 +159,11 @@ class Discovery:
 
     def step(self, log=None) -> dict:
         """One signed search + merge into the index. Summary dict for logging."""
-        if not self.queued:
-            return {"status": "queue-empty", "queued": 0}
-        term = self.queued.pop(0)
-        self.queued_set.discard(term)
+        with self._qlock:
+            if not self.queued:
+                return {"status": "queue-empty", "queued": 0}
+            term = self.queued.pop(0)
+            self.queued_set.discard(term)
         left = len(self.queued)
         if log:
             log(f"[discovery] crawling {term!r}  ({self.done_terms} done, {left} left in queue)",

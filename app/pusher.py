@@ -106,6 +106,19 @@ class Pusher:
                     f"({time.time() - t0:.1f}s)")
         # vault first: rows land in Atlas even if the Render push fails (401 etc.)
         self.index.upsert(rows, source="recent")
+        # freshness-first crawl: words from the newest uploads jump the discovery
+        # queue, so the next searches target the freshest part of the catalog
+        disc = getattr(self, "disc", None)
+        if disc is not None and rows:
+            try:
+                seeded = disc.seed_titles(
+                    [r.get("title") or "" for r in rows if isinstance(r, dict)],
+                    front=True)
+                if seeded:
+                    print(f"[pusher] freshness: front-queued {seeded} terms from "
+                          f"{len(rows)} newest rows", flush=True)
+            except Exception:
+                pass
         try:
             resp = self._push({"kind": "links", "term": "latest", "count": len(rows),
                                "results": rows})
@@ -232,7 +245,7 @@ class Pusher:
         next_heartbeat = 0.0
         first_poll = True
         started = time.time()
-        disc = self.start_discovery()  # no-op unless MKV_DISCOVERY/--discover
+        self.disc = self.start_discovery()  # no-op unless MKV_DISCOVERY/--discover
         while True:
             now = time.monotonic()
             if now >= next_heartbeat:
@@ -246,6 +259,7 @@ class Pusher:
                       f"watched_terms={max(0, len(self.seen.terms) - 1)}{disc_bit}",
                       flush=True)
                 next_heartbeat = now + 60
+            disc = self.disc
             if disc is not None and now >= next_trending:
                 # what real users are searching right now -> high-yield crawl seeds
                 try:
