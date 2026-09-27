@@ -28,6 +28,7 @@ from datetime import date, timedelta
 from .client import MkvbaseClient, MkvbaseError
 
 _WORD = re.compile(r"[a-z0-9]{3,}")
+_HEAD_WORD = re.compile(r"[a-z0-9]+")
 _YEAR_IN_TITLE = re.compile(r"\b((?:19|20)\d{2})\b")
 _YEAR_TERM = re.compile(r"^(?:19|20)\d{2}$")
 _YEAR_SLICE_TERM = re.compile(r"^(?:19|20)\d{2}\s+\S+")
@@ -39,15 +40,37 @@ _SERIES_MARK = re.compile(
 _SHOW_SEASON = re.compile(r"^(.+?)\s+s(\d{1,2})$", re.I)
 _FACET_SEASON = re.compile(r"^(?:s\d{1,2}|season\s+\d{1,2})$", re.I)
 _RESULT_CAP = 50
+_YEAR_CRAWL_VERSION = 3
+# --- series sweep agent: word-boundary probes ("ca ", "ca t ") reach show names
+# --- that no existing vault row mentions (Tribhuvan Mishra CA Topper case).
+_SERIES_SWEEP_VERSION = 1
+_IS_ZIP = re.compile(r"\bzip\b", re.I)
+_IS_EPISODE = re.compile(r"\bs\d{1,2}\s*e\s*\d{1,3}\b", re.I)
+# Rows starting with an OTT/quality tag ("NF Wednesday ...", "AMZN ...") extract
+# polluted heads; skip them in the zip-drain (plain _mine still covers them).
+_PROBE_TAG = re.compile(
+    r"^(?:nf|amzn|zee5|hotstar|sonyliv|prime|aha|hoichoi|hulu|hbo|apple|"
+    r"paramount|crunchyroll|stage)\b", re.I)
 _ALPHA = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _idx_to_probe(i: int) -> str:
+    """Cursor -> word-boundary probe: 'a ', 'b ' ... 'z ', 'aa ', 'ba ' ..."""
+    chars = []
+    i += 1  # bijective base-26: 0->a, 25->z, 26->aa, 2073->cat
+    while i:
+        i, r = divmod(i - 1, 26)
+        chars.append(_ALPHA[r])
+    return "".join(reversed(chars)) + " "
 # priority is drained first by every agent so title heads beat junk digraphs
-_LANES = ("priority", "day", "year", "alpha", "words", "facet")
+_LANES = ("priority", "day", "year", "alpha", "words", "series", "facet")
 _LANE_SAVE_CAP = {
     "priority": 15000,
     "day": 4000,
     "year": 3000,
     "alpha": 2000,
     "words": 6000,
+    "series": 6000,
     "facet": 500,
 }
 _NOISE = re.compile(
@@ -96,6 +119,18 @@ _PULL_ATTACH: tuple[str, ...] = (
     "zip", "mkv", "zee5", "amzn", "nf", "hotstar", "1080p", "720p", "hindi",
 )
 _SHOW_FORMATS = ("zip", "mkv", "pack", "complete")
+# Capped year searches recursively cross independent dimensions. A slice is not
+# complete merely because the API returned its newest 50 rows.
+_YEAR_SPLIT_GROUPS: tuple[tuple[str, ...], ...] = (
+    tuple(_ALPHA),  # exhaustive title coverage: every non-numeric title has a letter
+    _FACETS["video"],
+    _FACETS["language"],
+    _FACETS["source"],
+    _FACETS["format"],
+    _FACETS["ott"],
+    _FACETS["codec"] + _FACETS["audio"] + _FACETS["subtitle"],
+    _FACETS["season"],
+)
 _ALIASES = {
     "web-dl": "web dl", "webdl": "web dl", "web_dl": "web dl",
     "blu ray": "bluray", "blu-ray": "bluray", "blu_ray": "bluray",
@@ -121,6 +156,10 @@ _STOP = {"the", "and", "for", "with", "from", "www", "com", "dvd",
          "rar", "foo", "movies4u", "moviesdrives", "xdmovies"}
 # Facet tokens stay out of mining as lone words (seeded via facet lane instead)
 _STOP |= set(_FACET_SEEDS)
+# Keep grammatical glue inside title searches. Removing it changes the actual
+# substring ("Best of the Best" -> "best best") and makes exact search miss.
+_TITLE_GLUE = {"a", "an", "and", "at", "by", "for", "from", "in", "of",
+               "on", "the", "to", "with"}
 
 _YEAR_SEEDS = [str(y) for y in range(date.today().year, 1949, -1)]
 _FACET_SET = set(_FACET_SEEDS)
@@ -151,26 +190,49 @@ def _clean_title(title: str) -> str:
     t = (title or "").strip()
     t = re.sub(r"^\([^)]*\)\s*", "", t)
     t = re.sub(r"^@\S+\s+", "", t)
+    t = re.sub(r"^gdflix\s*\|\s*", "", t, flags=re.I)
     return t
 
 
 def _words_head(chunk: str, n: int = 5) -> str | None:
-    words = [w for w in _WORD.findall((chunk or "").lower()) if w not in _STOP]
+    words = [
+        w for w in _HEAD_WORD.findall((chunk or "").lower())
+        if w not in _STOP or w in _TITLE_GLUE
+    ]
+    # drop bare years stuck in the name chunk (Lanterns 2026 S01… → lanterns)
+    words = [w for w in words if not re.fullmatch(r"(?:19|20)\d{2}", w)]
+    # Leading articles are optional in search; preserving internal glue is not.
+    while len(words) > 1 and words[0] in {"a", "an", "the"}:
+        words.pop(0)
     if len(words) >= 2:
         return " ".join(words[:n])
     return words[0] if words else None
 
 
 def _title_head(title: str) -> str | None:
-    """Movie/show name: before Sxx/Season if present, else before year."""
+    """Movie/show name: cut at the earliest of year OR Sxx/Season.
+
+    Critical: 'Lanterns 2026 S01E06' must become 'lanterns', not 'lanterns 2026',
+    or season expands become 'lanterns 2026 s01' and real 'lanterns s01' never runs.
+    """
     t = _clean_title(title)
+    cuts = []
     m = _SERIES_MARK.search(t)
     if m:
-        return _words_head(t[:m.start()])
+        cuts.append(m.start())
     ym = _YEAR_IN_TITLE.search(t)
     if ym:
-        return _words_head(t[:ym.start()])
-    return None
+        cuts.append(ym.start())
+    if not cuts:
+        return None
+    return _words_head(t[:min(cuts)])
+
+
+def _canonical_show(show: str) -> str:
+    """Normalize show key: strip trailing years ('lanterns 2026' → 'lanterns')."""
+    s = _norm_term(show)
+    s = re.sub(r"\s+(?:19|20)\d{2}\b", "", s).strip()
+    return s
 
 
 def _seasons_in(title: str) -> set[int]:
@@ -183,9 +245,17 @@ def _seasons_in(title: str) -> set[int]:
     return found
 
 
+def _episodes_in(title: str) -> list[tuple[int, int]]:
+    """[(season, episode), ...] from S01E05-style marks."""
+    out = []
+    for m in re.finditer(r"\bs(\d{1,2})\s*e\s*(\d{1,3})\b", title or "", re.I):
+        out.append((int(m.group(1)), int(m.group(2))))
+    return out
+
+
 def _series_terms(show: str, seasons: set[int] | None = None) -> list[str]:
     """Expand a show into season + format searches (mkv episodes AND zip packs)."""
-    show = (show or "").strip().lower()
+    show = _canonical_show(show)
     if not show or len(show) < 3:
         return []
     seen = set(seasons or ())
@@ -202,7 +272,7 @@ def _series_terms(show: str, seasons: set[int] | None = None) -> list[str]:
 
 
 def _episode_terms(show: str, season: int, hi_ep: int = 24) -> list[str]:
-    show = (show or "").strip().lower()
+    show = _canonical_show(show)
     if not show:
         return []
     return [f"{show} s{season:02d}e{ep:02d}" for ep in range(1, hi_ep + 1)]
@@ -216,9 +286,12 @@ def _classify(term: str) -> str:
         return "facet"
     if t.isalpha() and 1 <= len(t) <= 3:
         return "alpha"
-    # 2–4 word clean heads = movie/show names → priority (Jana Nayagan)
     parts = t.split()
-    if 2 <= len(parts) <= 4 and not _reject_term(t):
+    # Clean title heads (including connector-heavy five-word names) are priority.
+    if 2 <= len(parts) <= 5 and not _reject_term(t):
+        return "priority"
+    if (len(parts) == 1 and t.isalpha() and len(t) >= 4
+            and t not in _FACET_SET and not _reject_term(t)):
         return "priority"
     return "words"
 
@@ -255,6 +328,7 @@ class Discovery:
         self.found_rows = 0
         self.day_cursor: date = date.today()
         self.agent_done: dict[str, int] = {}
+        self.sweep_cursor = 0  # series sweep position over prefix probes
         self._load()
 
     # --- compat for pusher heartbeat (total queued across lanes) ---
@@ -271,6 +345,18 @@ class Discovery:
             self.exhausted = set(d.get("exhausted") or [])
             self.done_terms = int(d.get("done_terms") or 0)
             self.found_rows = int(d.get("found_rows") or 0)
+            self.sweep_cursor = int(d.get("sweep_cursor") or 0)
+            if int(d.get("year_crawl_version") or 0) < _YEAR_CRAWL_VERSION:
+                # One-time migration: old capped slices were incorrectly marked
+                # done. Re-open them so recursive subdivision can finish them.
+                self.known_terms = {
+                    t for t in self.known_terms
+                    if not (_YEAR_TERM.match(t) or _YEAR_SLICE_TERM.match(t))
+                }
+                self.exhausted = {
+                    t for t in self.exhausted
+                    if not (_YEAR_TERM.match(t) or _YEAR_SLICE_TERM.match(t))
+                }
             dc = _parse_day(d.get("day_cursor"))
             if dc:
                 self.day_cursor = dc
@@ -319,6 +405,8 @@ class Discovery:
                         "found_rows": self.found_rows,
                         "day_cursor": self.day_cursor.isoformat(),
                         "agents": self.agents_n,
+                        "sweep_cursor": self.sweep_cursor,
+                        "year_crawl_version": _YEAR_CRAWL_VERSION,
                         "ts": time.time(),
                     }
                 with open(self.state_path, "w", encoding="utf-8") as f:
@@ -370,10 +458,10 @@ class Discovery:
         return self._queue(t, max_len=80, front=True, lane=lane)
 
     def _pop(self, prefer: str | None = None) -> tuple[str, str] | None:
-        """Priority lane always first, then prefer, then the rest."""
-        order = ["priority"]
-        if prefer and prefer != "priority":
-            order.append(prefer)
+        """Honor each agent's lane; dedicated year/day agents must not starve."""
+        order = [prefer] if prefer in _LANES else []
+        if "priority" not in order:
+            order.append("priority")
         order += [k for k in _LANES if k not in order]
         with self._qlock:
             for lane in order:
@@ -398,11 +486,27 @@ class Discovery:
         return n
 
     def _queue_show(self, show: str, seasons: set[int] | None = None,
-                    front: bool = False, lane: str = "priority") -> int:
+                    front: bool = False, lane: str = "priority",
+                    expand_eps: bool = True) -> int:
+        """Queue show + season/format terms; episode fan-out for every seen season.
+
+        Episode expand is what catches S01E01..E24 when the API only surfaces
+        a few mid-season hits (Lanterns vault had E03/E05/E06 only).
+        """
+        show = _canonical_show(show)
+        if not show:
+            return 0
         added = 0
+        # season/episode terms always front so save-cap cannot drop the tail
+        use_front = True if seasons else front
         for term in _series_terms(show, seasons):
-            if self._queue(term, max_len=80, front=front, lane=lane):
+            if self._queue(term, max_len=80, front=use_front, lane=lane):
                 added += 1
+        if expand_eps:
+            for sn in sorted(seasons or {1}):
+                for t in _episode_terms(show, sn):
+                    if self._queue(t, max_len=80, front=True, lane=lane):
+                        added += 1
         return added
 
     def seed_titles(self, titles: list[str], front: bool = False,
@@ -412,15 +516,15 @@ class Discovery:
             title = (title or "").strip()
             if not title:
                 continue
-            head = _title_head(title)
+            head = _canonical_show(_title_head(title) or "")
             seasons = _seasons_in(title)
             if head:
                 head_lane = "priority" if _classify(head) == "priority" else lane
                 if seasons:
-                    added += self._queue_show(head, seasons, front=front, lane=head_lane)
+                    added += self._queue_show(head, seasons, front=True, lane=head_lane)
                 elif self._queue(head, max_len=80, front=front, lane=head_lane):
                     added += 1
-                    if " " in head:
+                    if " " in head or len(head) >= 4:
                         for fmt in _SHOW_FORMATS:
                             if self._queue(f"{head} {fmt}", max_len=80,
                                            front=front, lane=head_lane):
@@ -440,7 +544,10 @@ class Discovery:
         seen: set[str] = set()
         for title in titles or []:
             head = _title_head(title or "")
-            if not head or head in seen or _reject_term(head):
+            if not head or _reject_term(head):
+                continue
+            head = _canonical_show(head)
+            if not head or head in seen:
                 continue
             seen.add(head)
             if front:
@@ -448,14 +555,21 @@ class Discovery:
                     added += 1
             elif self._queue(head, max_len=80, front=False, lane="priority"):
                 added += 1
-            if attach and " " in head:
+            # attach OTT/format for multi-word AND single-token series heads
+            seasons = _seasons_in(title or "")
+            if attach and (" " in head or seasons):
                 for sfx in _PULL_ATTACH:
                     if self._queue(f"{head} {sfx}", max_len=80, front=front,
                                    lane="priority"):
                         added += 1
-            seasons = _seasons_in(title or "")
             if seasons:
-                added += self._queue_show(head, seasons, front=front, lane="priority")
+                added += self._queue_show(head, seasons, front=True, lane="priority")
+            else:
+                # no Sxx on this title — still try s01 when title looks episodic
+                eps = _episodes_in(title or "")
+                if eps:
+                    added += self._queue_show(
+                        head, {s for s, _ in eps}, front=True, lane="priority")
         if log and added:
             log(f"[discovery] {tag}: pulled {len(seen)} heads -> priority +{added}",
                 flush=True)
@@ -509,6 +623,12 @@ class Discovery:
             self.day_cursor = date.today()
             if log:
                 log("[discovery] day-walk wrapped back to today", flush=True)
+        try:
+            self._advance_series_sweep(log=log)
+        except Exception as e:
+            if log:
+                log(f"[discovery] series-sweep error: {type(e).__name__}: {e}",
+                    flush=True)
         self.save()
 
     def _mine(self, rows: list[dict]) -> int:
@@ -559,6 +679,112 @@ class Discovery:
                 added += 1
         return added
 
+    def _queue_probe(self, probe: str, front: bool = True) -> bool:
+        """Queue a raw word-boundary probe (keeps its trailing space).
+
+        Probes bypass _queue/_norm_term — normalization strips the trailing
+        space that makes 'ca t ' match 'CA Topper' but plain 'cat' not.
+        """
+        p = (probe or "").strip().lower()
+        if not (1 <= len(p) <= 24) or not all(c in _ALPHA + " " for c in p):
+            return False
+        raw = p + " "
+        with self._qlock:
+            if raw in self.queued_set:
+                return False
+            if front:
+                self.lanes["series"].insert(0, raw)
+            else:
+                self.lanes["series"].append(raw)
+            self.queued_set.add(raw)
+        return True
+
+    def _drain_series_hits(self, rows: list[dict]) -> int:
+        """Mine season/zip hits from probe rows into show searches.
+
+        Zip packs are the strongest series signal: '… S01 … PrimeFix zip'
+        names the show and its seasons in one row (CA Topper S01 zips).
+        """
+        seeds: dict[str, set[int]] = {}
+        for r in rows:
+            t = (r.get("title") or "").strip()
+            if not t or len(t) < 8 or _PROBE_TAG.match(t):
+                continue
+            is_zip = bool(_IS_ZIP.search(t))
+            if not (is_zip or _SERIES_MARK.search(t)):
+                continue
+            head = _title_head(t)
+            if not head and is_zip:
+                cut = re.split(r"\b(?:zip|pack|complete)\b", t.lower())[0]
+                head = _words_head(cut)
+            if not head:
+                continue
+            head = _canonical_show(head)
+            if not head or len(head) < 3:
+                continue
+            seeds.setdefault(head, set()).update(_seasons_in(t) or {1})
+        added = 0
+        for head, seas in seeds.items():
+            # show + seasons + zip/mkv/pack/complete + S01E01.. fan-out
+            added += self._queue_show(head, seas, front=True, lane="series")
+        return added
+
+    def _advance_series_sweep(self, log=print) -> None:
+        """One word-boundary probe per day-tick: prefix + trailing space.
+
+        mkvbase search is substring-only. 'ca t ' matches 'CA Topper' while
+        bare 'ca' drowns under Captain America — and the alpha lane only
+        extends digraphs ('ca'->'caa'), never reaching word boundaries.
+        """
+        with self._qlock:
+            probe = _idx_to_probe(self.sweep_cursor)
+            self.sweep_cursor += 1
+        self._queue_probe(probe)
+        if log:
+            log(f"[discovery] series-sweep queued probe {probe!r} "
+                f"(cursor {self.sweep_cursor})", flush=True)
+
+    def _spill_series_probe(self, probe: str) -> int:
+        """Capped probe -> grow the last token letterwise.
+
+        mkvbase ANDs tokens by substring, so 'ca t' drowns under '...ca The...'
+        at the 50-cap; 'ca ta'..'ca tz' (last token grown) narrows to 'ca to'
+        which matches 'CA Topper'.
+        """
+        base = (probe or "").strip()
+        if not base:
+            return 0
+        added = 0
+        for c in _ALPHA:
+            if self._queue_probe(base + c):
+                added += 1
+        return added
+
+    def _spill_capped_year(self, term: str) -> int:
+        """Recursively subdivide a capped year query across facet dimensions."""
+        parts = _norm_term(term).split()
+        if not parts or not _YEAR_TERM.match(parts[0]):
+            return 0
+        suffix = " ".join(parts[1:])
+        represented = {
+            i for i, group in enumerate(_YEAR_SPLIT_GROUPS)
+            if any(re.search(rf"\b{re.escape(token)}\b", suffix) for token in group)
+        }
+        groups = (range(len(_YEAR_SPLIT_GROUPS)) if not suffix else
+                  (i for i in range(len(_YEAR_SPLIT_GROUPS)) if i not in represented))
+        added = 0
+        for i in groups:
+            for token in _YEAR_SPLIT_GROUPS[i]:
+                child = f"{term} {token}"
+                # _reject_term caps at five words; deeper useful slices still fit.
+                if len(child.split()) <= 5 and self._queue(
+                        child, max_len=80, front=True, lane="year"):
+                    added += 1
+            # A capped slice crosses one new independent dimension at a time.
+            if suffix:
+                break
+        return added
+
     def _spill_capped(self, term: str, n_rows: int, rows: list[dict] | None = None) -> int:
         """When API returns the 50-cap, fan out so buried titles/seasons/zips get reached."""
         if n_rows < _RESULT_CAP:
@@ -566,8 +792,8 @@ class Discovery:
         added = 0
         bare = _norm_term(term)
         rows = rows or []
-        if _YEAR_TERM.match(bare):
-            added += self._spill_facets_onto(bare, lane="year", front=True)
+        if _YEAR_TERM.match(bare) or _YEAR_SLICE_TERM.match(bare):
+            added += self._spill_capped_year(bare)
         if bare.isalpha() and 1 <= len(bare) <= 3 and bare not in _FACET_SET:
             for c in _ALPHA:
                 if self._queue(bare + c, front=True, min_len=1, lane="alpha"):
@@ -580,26 +806,21 @@ class Discovery:
         # show name capped -> season + zip packs (Prison Break case)
         sm = _SHOW_SEASON.match(bare)
         if sm:
-            show, sn = sm.group(1).strip(), int(sm.group(2))
-            added += self._queue_show(show, {sn}, front=True, lane="words")
-            for t in _episode_terms(show, sn):
-                if self._queue(t, max_len=80, front=True, lane="words"):
-                    added += 1
-            added += self._spill_facets_onto(show, lane="words", front=True)
-        elif " " in bare and not _YEAR_SLICE_TERM.match(bare):
+            show, sn = _canonical_show(sm.group(1)), int(sm.group(2))
+            added += self._queue_show(show, {sn}, front=True, lane="priority")
+            added += self._spill_facets_onto(show, lane="priority", front=True)
+        elif not _YEAR_SLICE_TERM.match(bare) and bare not in _FACET_SET \
+                and not _YEAR_TERM.match(bare) and not _FACET_SEASON.match(bare):
             seas: set[int] = set()
             for r in rows:
                 seas |= _seasons_in(r.get("title") or "")
-            show = bare
-            if not _SERIES_MARK.search(bare) and not _YEAR_IN_TITLE.search(bare):
-                show = bare
-            added += self._queue_show(show, seas or {1, 2, 3, 4, 5},
-                                     front=True, lane="words")
-            added += self._spill_facets_onto(show, lane="words", front=True)
-        elif bare not in _FACET_SET and not _YEAR_TERM.match(bare):
-            # single distinctive word at cap (e.g. show one-token) — attach facets
-            if len(bare) >= 4:
-                added += self._spill_facets_onto(bare, lane="words", front=True)
+            show = _canonical_show(bare)
+            # multi-word OR single-token show at 50-cap (Lanterns): expand seasons
+            if show and (seas or " " in show or len(show) >= 4):
+                # facets first, then season/eps so episode terms stay at front
+                added += self._spill_facets_onto(show, lane="priority", front=True)
+                added += self._queue_show(
+                    show, seas or {1}, front=True, lane="priority")
         return added
 
     def stats_line(self) -> str:
@@ -627,7 +848,10 @@ class Discovery:
                 "timeout", "needssession", "clearance", "target closed",
                 "connection", "network", "browser cannot launch"))
             if transient:
-                self._queue(term, min_len=1, front=True, lane=lane)
+                if lane == "series":
+                    self._queue_probe(term)  # keep the trailing space intact
+                else:
+                    self._queue(term, min_len=1, front=True, lane=lane)
                 self.save()
                 return {"status": "retry", "term": term, "lane": lane, "agent": agent,
                         "err": err, "took_s": round(time.time() - t0, 1),
@@ -639,7 +863,12 @@ class Discovery:
                     "err": err, "took_s": round(time.time() - t0, 1)}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
         mined = self._mine(rows)
-        spilled = self._spill_capped(term, len(rows), rows)
+        if lane == "series":
+            # probes never touch the generic alpha/year spill logic
+            spilled = (self._spill_series_probe(term) if len(rows) >= _RESULT_CAP
+                       else self._drain_series_hits(rows))
+        else:
+            spilled = self._spill_capped(term, len(rows), rows)
         new = 0
         if rows:
             new, _upd = self.index.upsert(rows, source=f"discovery:{lane}")
@@ -717,11 +946,50 @@ class Discovery:
                 gap = min(gap, 10)
             time.sleep(gap)
 
+    def _boost_hot(self, log=print) -> None:
+        """Front-queue miss-prone shows + S01 episode fan-out (after day seed).
+
+        Only scrubs year-tainted keys (lanterns 2026); does not wipe known hits
+        so we do not re-crawl the same 50-cap forever.
+        """
+        for hot in ("prison break", "jana nayagan", "lanterns",
+                    "tribhuvan mishra ca topper"):
+            with self._qlock:
+                dead = {t for t in (self.known_terms | self.exhausted | self.queued_set)
+                        if t.startswith(hot + " 20") or t.startswith(hot + " 19")}
+                for t in dead:
+                    self.known_terms.discard(t)
+                    self.exhausted.discard(t)
+                    self.queued_set.discard(t)
+                    for ln in self.lanes:
+                        try:
+                            self.lanes[ln].remove(t)
+                        except ValueError:
+                            pass
+            # queue any missing season/ep terms, then pin show+s01 at absolute front
+            self._queue_show(hot, {1}, front=True, lane="priority")
+            self._boost(hot, lane="priority")
+            self._boost(f"{hot} s01", lane="priority")
+            # pin low episode numbers ahead of facet spam (e01..e12)
+            for t in reversed(_episode_terms(hot, 1, hi_ep=12)):
+                if t not in self.known_terms:
+                    self._boost(t, lane="priority")
+        # One-time recovery for titles previously corrupted by stopword removal.
+        # Its 50-cap spill will generate format/facet slices if needed.
+        self._boost("best of the best", lane="priority")
+        log("[discovery] boosted hot titles: jana nayagan, prison break, "
+            "lanterns, tribhuvan mishra ca topper (+ s01 eps)", flush=True)
+
     def _day_loop(self, log) -> None:
         log(f"[discovery] day-walk agent online (every {self.day_every_s:.0f}s)",
             flush=True)
         self.day_cursor = date.today()
         self.advance_day_cursor(log=log)
+        # day-walk fronts heads — re-pin hot shows so S01 eps stay next
+        try:
+            self._boost_hot(log=log)
+        except Exception as e:
+            log(f"[discovery] hot boost skipped: {type(e).__name__}: {e}", flush=True)
         while True:
             time.sleep(self.day_every_s)
             try:
@@ -771,18 +1039,23 @@ class Discovery:
                 if n_series:
                     log(f"[discovery] vault series bootstrap: +{n_series} terms",
                         flush=True)
-            for hot in ("prison break", "jana nayagan"):
-                self._boost(hot, lane="priority")
-                self._queue_show(hot, front=True, lane="priority")
-                self._boost(hot, lane="priority")
-            log("[discovery] boosted hot titles: jana nayagan, prison break",
-                flush=True)
         except Exception as e:
             log(f"[discovery] vault bootstrap skipped: {type(e).__name__}: {e}",
+                flush=True)
+        # series sweep bootstrap: seed the alphabet, reach CA Topper now
+        try:
+            for c in reversed(_ALPHA):
+                self._queue_probe(c)
+            self._queue_probe("ca t")
+            log("[discovery] series sweep: 26 letter probes + 'ca t' queued",
+                flush=True)
+        except Exception as e:
+            log(f"[discovery] series bootstrap skipped: {type(e).__name__}: {e}",
                 flush=True)
         n = self.agents_n
         log(f"[discovery] fleet start: {n} agents + day-walk (simultaneous), "
             f"{self.stats_line()}, gap {self.gap_s:.0f}s", flush=True)
+        # day-walk seeds first day then _boost_hot (pins lanterns etc. after pull)
         threading.Thread(target=self._day_loop, args=(log,), daemon=True,
                          name="disc-daywalk").start()
         # 10 agents all at once: priority x3, day, year, alpha, words, facet x2, words
@@ -795,6 +1068,9 @@ class Discovery:
             threading.Thread(target=self._agent_loop, args=(i, prefer, log),
                              daemon=True, name=f"disc-a{i}-{prefer}").start()
             time.sleep(min(1.2, self.gap_s / max(n, 1)))
+        # the one more agent: dedicated series/zip sweep (probe lane)
+        threading.Thread(target=self._agent_loop, args=(n, "series", log),
+                         daemon=True, name=f"disc-a{n}-series").start()
         while True:
             time.sleep(60)
             ad = " ".join(f"{k}={v}" for k, v in sorted(self.agent_done.items()))

@@ -65,7 +65,23 @@ class MkvbaseClient:
         # loop: every browser call hops to this one worker (pusher + discovery + API).
         self._engine_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mkv-eng")
         self._engine_tid: int | None = None
+        # Multi-agent stampede kills cf_clearance: one clear at a time, few concurrent GETs.
+        self._clear_lock = threading.Lock()
+        self._http_sem = threading.Semaphore(
+            max(1, int(os.getenv("MKV_HTTP_CONCURRENCY", "2"))))
+        self._http_gap_s = float(os.getenv("MKV_HTTP_GAP_S", "0.4"))
+        self._last_http_at = 0.0
+        self._pace_lock = threading.Lock()
         self._load_persisted_session()
+
+    def _pace_http(self) -> None:
+        """Small gap between plain-HTTP calls so CF does not rotate clearance."""
+        with self._pace_lock:
+            now = time.time()
+            wait = self._http_gap_s - (now - self._last_http_at)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_http_at = time.time()
 
     def _on_engine(self, fn, *args, timeout: float | None = None, **kwargs):
         if self._engine_tid is not None and threading.get_ident() == self._engine_tid:
@@ -314,20 +330,38 @@ class MkvbaseClient:
         return True
 
     def ensure_session(self, timeout_s: int | None = None) -> bool:
-        """Make the session usable, cheapest way first. Verifies plain HTTP before
-        claiming success. Browser clearance is tried in short bursts (not one long
-        hang) so a stuck Turnstile gets a fresh browser instead of burning 3 min."""
-        # 1) already-good / renew / owner key / shared / cookiefree IP
-        if self.session_ready() and self._renew_http():
-            self.http_verified = True
-            return True
+        """Make the session usable, cheapest way first.
+
+        Single-flight: many discovery agents used to call this at once, thrash the
+        one browser worker, and burn a still-valid cf_clearance. Waiters reuse the
+        winner's session instead of clearing again.
+        """
+        # cheap unlocked peek — avoid queueing on the clear lock when already good
+        if self.session_ready() and self.http_verified is not False:
+            try:
+                if self._renew_http():
+                    self.http_verified = True
+                    return True
+            except NeedsSession:
+                pass
+        with self._clear_lock:
+            return self._ensure_session_locked(timeout_s)
+
+    def _ensure_session_locked(self, timeout_s: int | None = None) -> bool:
+        # re-check: another agent may have cleared while we waited for the lock
+        if self.session_ready():
+            try:
+                if self._renew_http():
+                    self.http_verified = True
+                    return True
+            except NeedsSession:
+                pass
         if self._bootstrap_http() or self._bootstrap_nokey():
             self.http_verified = True
             return True
         if self._refresh_from_shared() and self._renew_http() and self.session_ready():
             self.http_verified = True
             return True
-        # 2) browser: several short attempts beat one long failed wait
         per = int(os.getenv("MKV_CLEAR_ATTEMPT_S", "70"))
         attempts = int(os.getenv("MKV_CLEAR_ATTEMPTS", "3"))
         budget = int(timeout_s or self._bootstrap_timeout)
@@ -350,8 +384,7 @@ class MkvbaseClient:
                 last_err = e
             used += max(1, int(time.time() - t0))
             if self._release_browser:
-                self.release_browser()  # fresh browser next attempt
-            # brief pause so CF rate-limits / phone CPU can settle
+                self.release_browser()
             time.sleep(2)
         if last_err:
             raise last_err
@@ -421,15 +454,24 @@ class MkvbaseClient:
                 last = f"{type(e).__name__}: {e}"
                 continue
             if r.status_code == 200 and r.text.strip():
+                low = r.text[:800].lower()
+                # CF sometimes returns 200 + challenge HTML; treat as dead clearance
+                if ("just a moment" in low or "cf-browser-verification" in low
+                        or "attention required" in low):
+                    blocked += 1
+                    last = "HTTP 200 challenge-html"
+                    continue
                 self._impersonate = impersonate
                 self._absorb(s, r.cookies.items())
+                self.http_verified = True
                 return r.text
             if r.status_code == 403:
                 blocked += 1
             last = f"HTTP {r.status_code}"
-        if blocked == len(order):  # every fingerprint refused: clearance dead (or skip rule not matching)
+        if blocked:
             self._drop_session(s, cf_dead=True)
-            raise NeedsSession("Cloudflare clearance expired (403)")
+            self.http_verified = False
+            raise NeedsSession("Cloudflare clearance expired (403/challenge)")
         raise MkvbaseError(f"plain-HTTP fetch failed: {last}")
 
     def _fetch_http(self, make_url) -> dict:
@@ -437,10 +479,19 @@ class MkvbaseClient:
             raise NeedsSession("session missing or expired")
         with self._lock:
             ck = dict(self._session.cookies)
+        self._pace_http()
         text = self._http_request(make_url(ck))
         obj = self._extract_json(text)
         if obj is None:
             snippet = re.sub(r"\s+", " ", text)[:200]
+            # bare HTML with no results almost always means CF interstitial
+            if "<html" in (text or "")[:200].lower():
+                with self._lock:
+                    s = self._session
+                if s is not None:
+                    self._drop_session(s, cf_dead=True)
+                self.http_verified = False
+                raise NeedsSession("Cloudflare challenge HTML (no JSON)")
             raise MkvbaseError(f"no JSON with 'results' in response: {snippet!r}")
         return obj
 
@@ -505,19 +556,28 @@ class MkvbaseClient:
         raise MkvbaseError(f"no JSON with 'results' in response: {snippet!r}")
 
     def _fetch(self, make_url, timeout_s: int) -> tuple[dict, str]:
-        """Plain HTTP, then clearance + HTTP, then browser fetch. Safe from any thread."""
+        """Plain HTTP, then clearance + HTTP, then browser fetch. Safe from any thread.
+
+        HTTP concurrency is capped so 10 discovery agents cannot stampede CF.
+        """
+        self._http_sem.acquire()
         try:
-            return self._fetch_http(make_url), "http"
-        except (NeedsSession, MkvbaseError):
-            pass
-        # ensure_session may "succeed" with a shared/persisted corpse that still 403s —
-        # catch that and fall through to a real browser clearance.
-        try:
-            if self.ensure_session(timeout_s):
+            try:
                 return self._fetch_http(make_url), "http"
-        except (NeedsSession, MkvbaseError):
-            pass
-        return self._fetch_browser(make_url, timeout_s)
+            except NeedsSession:
+                pass
+            except MkvbaseError:
+                pass
+            try:
+                if self.ensure_session(timeout_s):
+                    return self._fetch_http(make_url), "http"
+            except NeedsSession:
+                pass
+            except MkvbaseError:
+                pass
+            return self._fetch_browser(make_url, timeout_s)
+        finally:
+            self._http_sem.release()
 
     # ------------------------------------------------------------------ API
     def _search_url(self, term: str, ent: int):

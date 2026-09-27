@@ -11,6 +11,9 @@ REM words, facet/OTT x2, words) + day-walk that also priority-pulls each day
 set MKV_DISCOVERY_AGENTS=10
 set MKV_DISCOVERY_GAP_S=15
 set MKV_DISCOVERY_VAULT_PULL=5000
+REM Cap concurrent mkvbase GETs — 10 agents used to stampede and kill cf_clearance
+set MKV_HTTP_CONCURRENCY=2
+set MKV_HTTP_GAP_S=0.4
 set /p MKV_SYNC_KEY=<data\sync_key.txt
 set /p MKV_MONGODB_URI=<data\mongo_uri.txt
 :loop
