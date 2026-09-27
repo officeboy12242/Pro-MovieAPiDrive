@@ -234,7 +234,7 @@ class MongoIndex:
         from pymongo import DESCENDING, MongoClient
         self._DESC = DESCENDING
         self._client = MongoClient(uri, serverSelectionTimeoutMS=8000,
-                                   socketTimeoutMS=20000, maxPoolSize=4)
+                                   socketTimeoutMS=20000, maxPoolSize=8)
         self._col = self._client[db or os.getenv("MKV_MONGO_DB", "mkvbase")].links
         self._col.create_index("_seq")  # first-seen order, for newest-first paging
         self._hits = 0
@@ -295,6 +295,20 @@ class MongoIndex:
         rows = list(self._col.find(query, {"_id": 0, "_seq": 0, "_upd": 0})
                     .sort("_seq", self._DESC).limit(max(0, limit)))
         return {"count": total, "results": rows}
+
+    def titles_on_created_day(self, day: str, limit: int = 300) -> list[str]:
+        """Titles whose created_at falls on YYYY-MM-DD (site upload day)."""
+        day = (day or "")[:10]
+        if len(day) < 10:
+            return []
+        try:
+            cur = self._col.find(
+                {"created_at": {"$regex": f"^{day}"}},
+                {"title": 1, "_id": 0},
+            ).limit(max(0, limit))
+            return [str(r["title"]).strip() for r in cur if r.get("title")]
+        except Exception:
+            return []
 
     def stats(self) -> dict:
         return {"rows": self._col.estimated_document_count(),

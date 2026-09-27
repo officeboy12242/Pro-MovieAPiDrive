@@ -4,6 +4,13 @@ REM Registered as a Scheduled Task (mkvbase-pusher); runs at logon, loops foreve
 cd /d E:\Projects\mkvbase-cf-api
 set MKV_RENDER_URL=https://pro-movieapidrive.onrender.com
 set MKV_DATA_DIR=data
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
+REM Multi-agent discovery: 10 bots simultaneous (priority x3, day, year, alpha,
+REM words, facet/OTT x2, words) + day-walk that also priority-pulls each day
+set MKV_DISCOVERY_AGENTS=10
+set MKV_DISCOVERY_GAP_S=15
+set MKV_DISCOVERY_VAULT_PULL=5000
 set /p MKV_SYNC_KEY=<data\sync_key.txt
 set /p MKV_MONGODB_URI=<data\mongo_uri.txt
 :loop

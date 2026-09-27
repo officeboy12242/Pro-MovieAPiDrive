@@ -96,8 +96,8 @@ class CamoufoxEngine(BaseEngine):
                                "username": urllib.parse.unquote(p.username or ""),
                                "password": urllib.parse.unquote(p.password or "")}
             kwargs["geoip"] = True
-        elif os.getenv("MKV_GEOIP", "true").lower() in ("1", "true", "yes"):
-            kwargs["geoip"] = True  # match phone/VPS public IP in fingerprint
+        elif os.getenv("MKV_GEOIP", "false").lower() in ("1", "true", "yes"):
+            kwargs["geoip"] = True
         self._set_phase("launch")
         self._cm = Camoufox(**kwargs)
         self._pw = self._cm.__enter__()

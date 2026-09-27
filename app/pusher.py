@@ -253,7 +253,8 @@ class Pusher:
                 up = int(time.time() - started)
                 disc_bit = ""
                 if disc is not None:
-                    disc_bit = (f" | discovery done={disc.done_terms} "
+                    agents = getattr(disc, "agents_n", 1)
+                    disc_bit = (f" | discovery agents={agents} done={disc.done_terms} "
                                 f"queued={len(disc.queued)} rows={disc.found_rows}")
                 print(f"[alive] up {up // 60}m{up % 60:02d}s | "
                       f"session={'ok' if self.client.session_ready() else 'warming'} | "
