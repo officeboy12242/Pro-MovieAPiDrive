@@ -246,6 +246,11 @@ class MongoIndex:
     sleeps and restarts. One document per link row, deduplicated on _id (the
     row key: id/url/title) via upserts; queries are single-index sorts.
 
+    Search semantics = the mkvbase site's own: every whitespace token of the
+    query must appear as a whole token in the row TITLE (case-insensitive).
+    Implemented with a `title_tokens` multikey array + $all (index-backed, no
+    fetch window), which is exactly AND-over-tokens.
+
     db/collection: MKV_MONGO_DB (default mkvbase) / links.
     """
 
@@ -256,7 +261,27 @@ class MongoIndex:
                                    socketTimeoutMS=20000, maxPoolSize=8)
         self._col = self._client[db or os.getenv("MKV_MONGO_DB", "mkvbase")].links
         self._col.create_index("_seq")  # first-seen order, for newest-first paging
+        self._col.create_index("title_tokens")  # whole-token AND search
+        self._backfill_title_tokens()
         self._hits = 0
+
+    def _backfill_title_tokens(self) -> None:
+        """One-time migration: rows written before title_tokens existed get the
+        array computed server-side ($split of $title). No-op when current."""
+        try:
+            if self._col.count_documents({"title_tokens": {"$exists": False}},
+                                         limit=1) == 0:
+                return
+            self._col.update_many(
+                {"title_tokens": {"$exists": False}},
+                [{"$set": {"title_tokens": {
+                    "$map": {"input": {"$split": [
+                        {"$toLower": {"$ifNull": ["$title", ""]}}, " "]},
+                    "as": "t", "in": "$$t"}}}}],
+            )
+            print("[index] backfilled title_tokens for site-style search", flush=True)
+        except Exception:
+            pass
 
     @staticmethod
     def _doc(row: dict, source: str, seq: float) -> dict:
@@ -267,6 +292,8 @@ class MongoIndex:
         if source:
             doc["_src"] = source
         doc["_seq"] = seq
+        # site-style search: whole tokens of the title, lowercased
+        doc["title_tokens"] = list({t for t in str(doc.get("title") or "").lower().split() if t})
         return doc
 
     def upsert(self, rows: list[dict], source: str = "") -> tuple[int, int]:
@@ -304,28 +331,17 @@ class MongoIndex:
 
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
         """Newest-discovered-first rows, filtered exactly like the mkvbase site
-        search: whitespace tokens, ALL must appear as whole tokens in the title
-        (case-insensitive). Mongo cannot do that natively, so the AND-token filter
-        is applied on the fetched page after a wide sort — the site's own result
-        pages are similar in size, so limits stay honest by over-fetching."""
-        import re as _re
+        search: whitespace tokens, ALL must appear as whole tokens in the title.
+        Backed by the title_tokens multikey index ($all) — exact at any scale,
+        no fetch window."""
         self._hits += 1
-        tokens = _site_tokens(q)
-        if not tokens:
-            total = self._col.count_documents({})
-            rows = list(self._col.find({}, {"_id": 0, "_seq": 0, "_upd": 0})
-                        .sort("_seq", self._DESC).limit(max(0, limit)))
-            return {"count": total, "results": rows}
-        # Whole-token match needs a tokenized index the collection does not have;
-        # over-fetch candidates with permissive whole-word regexes (one per token,
-        # OR'd) then narrow in Python to the exact ALL-tokens-in-title rule.
-        candidates_q = {"$or": [{"title": {"$regex": rf"\b{_re.escape(t)}\b", "$options": "i"}}
-                                for t in tokens]}
-        fetch_n = min(20000, max(limit * 20, 5000))
-        rows = list(self._col.find(candidates_q, {"_id": 0, "_seq": 0, "_upd": 0})
-                    .sort("_seq", self._DESC).limit(fetch_n))
-        rows = [r for r in rows if _site_title_match(r.get("title") or "", tokens)]
-        return {"count": len(rows), "results": rows[:max(0, limit)]}
+        tokens = list({t.lower() for t in _site_tokens(q)})
+        query = {"title_tokens": {"$all": tokens}} if tokens else {}
+        total = self._col.count_documents(query)
+        rows = list(self._col.find(query, {"_id": 0, "_seq": 0, "_upd": 0,
+                                           "title_tokens": 0})
+                    .sort("_seq", self._DESC).limit(max(0, limit)))
+        return {"count": total, "results": rows}
 
     def titles_on_created_day(self, day: str, limit: int = 300) -> list[str]:
         """Titles whose created_at falls on YYYY-MM-DD (site upload day)."""
