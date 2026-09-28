@@ -6,7 +6,7 @@ REM  2. disables the logon autostart (Startup folder)
 REM  Run again any time - safe to re-run.
 REM ============================================================
 echo [1/3] stopping pusher + restart loop...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -like '*run-pusher*' -or $_.CommandLine -like '*start-pusher*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output ('  killed loop ' + $_.ProcessId) }"
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -like '*run-crawler-loop*' -or $_.CommandLine -like '*run-pusher*' -or $_.CommandLine -like '*start-pusher*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output ('  killed loop ' + $_.ProcessId) }"
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*app.pusher*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output ('  killed crawler ' + $_.ProcessId) }"
 
 echo [2/3] disabling logon autostart...
