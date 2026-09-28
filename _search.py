@@ -58,10 +58,19 @@ def main(argv: list[str]) -> int:
         if i:
             time.sleep(GAP_S)
         try:
-            obj = client.search_http(term)
+            try:
+                obj = client.search_http(term)
+            except NeedsSession:
+                # pusher not running / session expired: clear Cloudflare ourselves
+                print("  no fresh session - clearing Cloudflare once "
+                      "(home IP or browser, this can take ~1-2 min)…", flush=True)
+                if not client.ensure_session(timeout_s=210):
+                    raise NeedsSession("could not clear Cloudflare")
+                obj = client.search_http(term)
         except NeedsSession as e:
-            print(f"{term!r}: no usable Cloudflare session right now ({str(e)[:60]}).\n"
-                  f"  The pusher is probably re-clearing — retry in a minute.", flush=True)
+            print(f"{term!r}: no usable Cloudflare session ({str(e)[:60]}).\n"
+                  f"  Start the fleet once (START-auto-everything.cmd) and retry.",
+                  flush=True)
             failed += 1
             continue
         except Exception as e:
