@@ -401,6 +401,7 @@ def search(term: str = Query(..., min_length=1, max_length=100),
         if rows:
             return {"term": term, "count": len(rows), "difficulty": None,
                     "engine": "links-index", "cached": True, "source": "links_index",
+                    "match": "site-style: all query tokens found in title",
                     "took_ms": int((time.time() - t0) * 1000), "results": rows}
         stale = _stale("search", term)
         if stale is None:
@@ -434,7 +435,9 @@ def search(term: str = Query(..., min_length=1, max_length=100),
 @app.get("/links")
 def links(limit: int = Query(50, ge=1, le=1000), q: str | None = Query(None)):
     """Every unique link row ever synced/scraped, newest first, deduplicated by
-    id/url/title. Optional ?q= substring filter on title/url."""
+    id/url/title. Optional ?q= filtered exactly like the mkvbase site search:
+    split on whitespace, every token must appear as a whole token in the row's
+    title (case-insensitive, order-independent). Example: /links?q=paathirathri%20zee5."""
     out = _links_index.recent(limit=limit, q=q)
     return {"total": _links_index.stats()["rows"], **out}
 

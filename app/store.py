@@ -15,6 +15,25 @@ import time
 _KEYS = ("id", "url", "title")
 
 
+def _site_tokens(q: str) -> list[str]:
+    """mkvbase site search semantics (validated live against the signed search API):
+    the query is split on whitespace and EVERY token must match the row TITLE as a
+    whole token (substring inside a token does not count: 'paathirathi' finds 0 rows
+    while 'paathirathri' finds 6). Matching is token-anywhere/any-order AND —
+    'zee5 paathirathri' == 'paathirathri zee5' == 'paathirathri  web dl'. URLs are
+    NOT searched: 'gdflix.dev' matches rows whose url is gdflix.dev yet returns 0.
+    Returns [] only for a whitespace-only query (which the site treats as no filter)."""
+    return [t for t in (q or "").split() if t]
+
+
+def _site_title_match(title: str, tokens: list[str]) -> bool:
+    if not tokens:
+        return True
+    title_tokens = (title or "").lower().split()
+    lowered = [t.lower() for t in tokens]
+    return all(tok in title_tokens for tok in lowered)
+
+
 def _row_key(row: dict) -> str | None:
     """Stable dedup key for a link row: id -> url -> title."""
     for k in _KEYS:
@@ -205,15 +224,15 @@ class LinksIndex:
     # ------------------------------------------------------------------ read
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
         """Newest-first rows (file order is insertion order), optionally filtered
-        by a case-insensitive substring on title/url."""
+        exactly like the mkvbase site search: whitespace tokens, ALL must appear
+        as whole tokens in the title (case-insensitive)."""
         with self._lock:
             self._hits += 1
             rows = list(self._rows.values())
         rows.reverse()
-        if q:
-            q = q.lower()
-            rows = [r for r in rows if q in (r.get("title") or "").lower()
-                    or q in (r.get("url") or "").lower()]
+        tokens = _site_tokens(q)
+        if tokens:
+            rows = [r for r in rows if _site_title_match(r.get("title") or "", tokens)]
         return {"count": len(rows), "results": rows[:max(0, limit)]}
 
     def stats(self) -> dict:
@@ -284,17 +303,29 @@ class MongoIndex:
         return new, updated
 
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
-        """Newest-discovered-first rows, optional case-insensitive substring on
-        title/url (regex-escaped)."""
+        """Newest-discovered-first rows, filtered exactly like the mkvbase site
+        search: whitespace tokens, ALL must appear as whole tokens in the title
+        (case-insensitive). Mongo cannot do that natively, so the AND-token filter
+        is applied on the fetched page after a wide sort — the site's own result
+        pages are similar in size, so limits stay honest by over-fetching."""
         import re as _re
         self._hits += 1
-        query = ({"$or": [{"title": {"$regex": _re.escape(q), "$options": "i"}},
-                          {"url": {"$regex": _re.escape(q), "$options": "i"}}]}
-                 if q else {})
-        total = self._col.count_documents(query)
-        rows = list(self._col.find(query, {"_id": 0, "_seq": 0, "_upd": 0})
-                    .sort("_seq", self._DESC).limit(max(0, limit)))
-        return {"count": total, "results": rows}
+        tokens = _site_tokens(q)
+        if not tokens:
+            total = self._col.count_documents({})
+            rows = list(self._col.find({}, {"_id": 0, "_seq": 0, "_upd": 0})
+                        .sort("_seq", self._DESC).limit(max(0, limit)))
+            return {"count": total, "results": rows}
+        # Whole-token match needs a tokenized index the collection does not have;
+        # over-fetch candidates with permissive whole-word regexes (one per token,
+        # OR'd) then narrow in Python to the exact ALL-tokens-in-title rule.
+        candidates_q = {"$or": [{"title": {"$regex": rf"\b{_re.escape(t)}\b", "$options": "i"}}
+                                for t in tokens]}
+        fetch_n = min(20000, max(limit * 20, 5000))
+        rows = list(self._col.find(candidates_q, {"_id": 0, "_seq": 0, "_upd": 0})
+                    .sort("_seq", self._DESC).limit(fetch_n))
+        rows = [r for r in rows if _site_title_match(r.get("title") or "", tokens)]
+        return {"count": len(rows), "results": rows[:max(0, limit)]}
 
     def titles_on_created_day(self, day: str, limit: int = 300) -> list[str]:
         """Titles whose created_at falls on YYYY-MM-DD (site upload day)."""
