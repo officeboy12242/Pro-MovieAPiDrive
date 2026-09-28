@@ -38,6 +38,30 @@ _OTTS = ("zee5", "amzn", "nf", "hotstar", "sonyliv", "hoichoi", "aha",
 _QUALS = ("1080p", "720p", "480p", "2160p", "10bit", "hevc")
 _LANGS = ("hindi", "tamil", "telugu", "malayalam", "kannada", "english", "multi")
 _ALPHA = "abcdefghijklmnopqrstuvwxyz"
+import re as _re
+
+_HEAD_WORD = _re.compile(r"[a-z0-9]+")
+_YEAR_IN_TITLE = _re.compile(r"\b((?:19|20)\d{2})\b")
+_SERIES_MARK = _re.compile(r"\b(?:s\d{1,2}\s*e?\s*\d{0,3}|season\s*\d{1,2})", _re.I)
+_NOISE = _re.compile(
+    r"gdflix|hubcloud|hdrip|camrip|dvdscr|www\.|\.com|\.in\b|downloaded",
+    _re.I)
+
+
+def _title_head(title: str) -> str | None:
+    """Clean searchable head of a row title: cut at year/season, keep the words
+    before it ('Paathirathri 2025 2160p ZEE5 WEB DL...' -> 'paathirathri').
+    Sibling uploads of the same film/series share this head, and a search with
+    <50 total matches returns them ALL — the one lever that reaches old ids."""
+    t = (title or "").strip().lower()
+    t = _re.sub(r"^[a-z0-9 ]{2,15}\s*\|\s*", "", t)  # 'GDFlix | ' prefix
+    cuts = [m.start() for m in (_YEAR_IN_TITLE.search(t), _SERIES_MARK.search(t)) if m]
+    if cuts:
+        t = t[:min(cuts)]
+    words = [w for w in _HEAD_WORD.findall(t) if len(w) >= 2 and not _NOISE.search(w)]
+    if len(words) >= 2:
+        return " ".join(words[:5])
+    return words[0] if words else None
 
 
 class IdGapMiner:
@@ -57,12 +81,14 @@ class IdGapMiner:
         # runtime state (persisted so restarts do not redo finished blocks)
         self.done_blocks: set[int] = set()
         self.searched_terms: dict[str, float] = {}
+        self.term_stats: dict[str, dict] = {}  # kind -> {tries, hits_in_block, new}
         self.round_started = 0.0
         self.stats = {"rounds": 0, "terms_done": 0, "rows_new": 0,
                       "coverage_last": None, "plan": [], "picked_block": None,
                       "picked_era": None}
         self._load()
         self._lock = threading.Lock()
+        self._seed_cache: dict[int, list[str]] = {}  # block -> unsearched heads
 
     # ------------------------------------------------------------ state
     def _load(self) -> None:
@@ -72,6 +98,7 @@ class IdGapMiner:
             self.done_blocks = {int(b) for b in d.get("done_blocks", [])}
             self.searched_terms = {k: float(v) for k, v in
                                    (d.get("searched_terms") or {}).items()}
+            self.term_stats = d.get("term_stats") or {}
             self.round_started = float(d.get("round_started") or 0)
             self.stats.update(d.get("stats") or {})
         except Exception:
@@ -84,6 +111,7 @@ class IdGapMiner:
                 with open(self.state_path, "w", encoding="utf-8") as f:
                     json.dump({"done_blocks": sorted(self.done_blocks)[-500:],
                                "searched_terms": self.searched_terms,
+                               "term_stats": self.term_stats,
                                "round_started": self.round_started,
                                "stats": self.stats}, f)
             except Exception:
@@ -136,7 +164,42 @@ class IdGapMiner:
                     return id_dates[nb]
         return ""
 
+    # ------------------------------------------------------------ seeds
+    def _seeds_for_block(self, blk: int, n: int = 6) -> list[str]:
+        """Title-heads of rows we already hold in the thin block. Searching an
+        exact head pulls that title's SIBLING uploads (other episodes/qualities
+        uploaded around the same time) — the highest-yield way to fill a block,
+        because sub-50 searches return everything the site has for it."""
+        col = self._col()
+        if col is None:
+            return []
+        heads = self._seed_cache.get(blk)
+        if heads is None:
+            heads = []
+            for r in col.find({"id": {"$gte": blk * self.block,
+                                      "$lt": (blk + 1) * self.block}},
+                              {"title": 1}).sort("id", -1).limit(300):
+                h = _title_head(r.get("title") or "")
+                if h and len(h) >= 3:
+                    heads.append(h)
+            seen: set[str] = set()
+            heads = [h for h in heads if not (h in seen or seen.add(h))]
+            self._seed_cache[blk] = heads
+        fresh = [h for h in heads if h not in self.searched_terms]
+        return fresh[:n]
+
     # ------------------------------------------------------------ term plan
+    def _term_kind(self, term: str) -> str:
+        if _re.fullmatch(r"(?:19|20)\d{2}(?: [a-z]{3})?", term):
+            return "era-year"
+        if any(f" {o}" in f" {term}" or term.startswith(o) for o in _OTTS):
+            return "era-ott"
+        if any(f" {q}" in f" {term}" for q in _QUALS):
+            return "era-quality"
+        if any(f" {l}" in f" {term}" for l in _LANGS):
+            return "era-language"
+        return "seed-head"
+
     def _terms_for_era(self, era: str) -> list[str]:
         """Era (date str) -> targeted search terms. Lean: every term must earn
         its request, deduped against this miner's own history."""
@@ -184,11 +247,20 @@ class IdGapMiner:
 
     # ------------------------------------------------------------ loop
     def step(self, agent: str = "a1") -> dict:
-        blk, era, terms = self._next_terms(1)
+        # 1) seeds first: exact title-heads from rows inside the thin block
+        blk, era, terms = self._next_terms(0)
+        if blk is not None:
+            seeds = self._seeds_for_block(blk)
+            if seeds:
+                terms = [f"seed:{s}" for s in seeds]
         if not terms:
-            # every thin block worked this round — sleep until the next round
-            return {"status": "idle", "agent": agent}
-        term = terms[0]
+            _b, _e, era_terms = self._next_terms(1)
+            if not era_terms:
+                return {"status": "idle", "agent": agent}
+            blk, era, terms = _b, _e, era_terms
+        raw = terms[0]
+        term = raw[5:] if raw.startswith("seed:") else raw
+        kind = self._term_kind(term)
         t0 = time.time()
         try:
             obj = self.client.search(term)
@@ -199,18 +271,27 @@ class IdGapMiner:
                     "err": f"{type(e).__name__}: {str(e)[:100]}"}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
         new, _upd = self.index.upsert(rows, source=f"idgap:{agent}:b{blk}")
+        in_block = sum(1 for r in rows
+                       if blk is not None and blk * self.block <= (r.get("id") or 0)
+                       < (blk + 1) * self.block)
+        st = self.term_stats.setdefault(kind, {"tries": 0, "in_block": 0, "new": 0})
+        st["tries"] += 1
+        st["in_block"] += in_block
+        st["new"] += new
         with self._lock:
             self.stats["terms_done"] += 1
             self.stats["rows_new"] += new
         self.searched_terms[term] = time.time()
+        self._seed_cache.pop(blk, None)  # refresh seeds after block work
         # a block is done when this term-plan for its era is exhausted
         if len([t for t in self._terms_for_era(era)
-                if time.time() - self.searched_terms.get(t, 0) > 20 * 3600]) == 0:
+                if time.time() - self.searched_terms.get(t, 0) > 20 * 3600]) == 0 \
+                and not self._seeds_for_block(blk):
             self.done_blocks.add(blk)
         self.save()
-        return {"status": "ok", "term": term, "agent": agent, "block": blk,
-                "era": era, "rows": len(rows), "new": new,
-                "took_s": round(time.time() - t0, 1)}
+        return {"status": "ok", "term": term, "kind": kind, "agent": agent,
+                "block": blk, "era": era, "rows": len(rows), "new": new,
+                "in_block": in_block, "took_s": round(time.time() - t0, 1)}
 
     def run(self, log=print, stop: threading.Event | None = None) -> None:
         stop = stop or threading.Event()
@@ -221,8 +302,9 @@ class IdGapMiner:
                 try:
                     info = self.step(agent)
                     if info.get("status") == "ok":
-                        log(f"[idgap:{agent}] ok {info['term']!r} block={info['block']} "
-                            f"era={info['era']}: {info['rows']} rows, {info['new']} new "
+                        log(f"[idgap:{agent}] ok {info['term']!r}/{info.get('kind')} "
+                            f"block={info['block']} era={info['era']}: {info['rows']} rows, "
+                            f"{info['new']} new, {info.get('in_block', 0)} in-block "
                             f"({info['took_s']}s)  cov={self.stats.get('coverage_last')}%",
                             flush=True)
                     elif info.get("status") == "retry":
@@ -244,9 +326,11 @@ class IdGapMiner:
     def status_line(self) -> str:
         with self._lock:
             s = self.stats
+            kinds = " ".join(f"{k}:{v['tries']}t/{v['new']}n" for k, v in
+                             sorted(self.term_stats.items()))
             return (f"rounds={s['rounds']} terms={s['terms_done']} "
                     f"new_rows={s['rows_new']} cov={s.get('coverage_last')}% "
-                    f"block={s.get('picked_block')} era={s.get('picked_era')}")
+                    f"block={s.get('picked_block')} era={s.get('picked_era')} {kinds}")
 
 
 def start_idgap(client: MkvbaseClient, state_dir: str, log=print) -> IdGapMiner | None:
