@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.client import MkvbaseClient, MkvbaseError  # noqa: E402
 from app.discovery import Discovery  # noqa: E402
 from app.engines import make_engine  # noqa: E402
+from app.idgap import start_idgap  # noqa: E402
 from app.store import make_index  # noqa: E402
 
 _RECENT_MARK = "_recent_"
@@ -243,9 +244,18 @@ class Pusher:
         next_search_tick = 0.0
         next_trending = 0.0
         next_heartbeat = 0.0
+        next_idgap_status = 0.0
         first_poll = True
         started = time.time()
         self.disc = self.start_discovery()  # no-op unless MKV_DISCOVERY/--discover
+        # IdGap miner: id-coverage agents filling the thinnest eras of the vault.
+        # Independent lane from Discovery (own state file: data/idgap_state.json).
+        self.idgap = None
+        if os.getenv("MKV_IDGAP", "true").lower() in ("1", "true", "yes"):
+            try:
+                self.idgap = start_idgap(self.client, os.path.dirname(self.seen.path) or ".")
+            except Exception as e:
+                print(f"[idgap] failed to start: {type(e).__name__}: {e}", flush=True)
         while True:
             now = time.monotonic()
             disc = self.disc
@@ -256,11 +266,24 @@ class Pusher:
                     agents = getattr(disc, "agents_n", 1)
                     disc_bit = (f" | discovery agents={agents} done={disc.done_terms} "
                                 f"queued={len(disc.queued)} rows={disc.found_rows}")
+                idgap_bit = ""
+                if self.idgap is not None:
+                    idgap_bit = f" | idgap {self.idgap.status_line()}"
                 print(f"[alive] up {up // 60}m{up % 60:02d}s | "
                       f"session={'ok' if self.client.session_ready() else 'warming'} | "
-                      f"watched_terms={max(0, len(self.seen.terms) - 1)}{disc_bit}",
+                      f"watched_terms={max(0, len(self.seen.terms) - 1)}{disc_bit}{idgap_bit}",
                       flush=True)
                 next_heartbeat = now + 60
+            if self.idgap is not None and now >= next_idgap_status:
+                try:
+                    cov = self.idgap.coverage()
+                    thin = [f"b{b['block_start']}({b['have']})" for b in (cov.get("thin_blocks") or [])[:5]]
+                    print(f"[idgap:status] coverage={cov.get('coverage_pct')}% of site ids "
+                          f"({cov.get('total_rows', 0):,}/{cov.get('max_id', 0):,}) "
+                          f"thin: {' '.join(thin) or 'none'}", flush=True)
+                except Exception as e:
+                    print(f"[idgap:status] failed: {type(e).__name__}: {e}", flush=True)
+                next_idgap_status = now + 1800
             if disc is not None and now >= next_trending:
                 # what real users are searching right now -> high-yield crawl seeds
                 try:

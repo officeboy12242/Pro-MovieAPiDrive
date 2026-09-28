@@ -1,0 +1,284 @@
+"""IdGap miner — id-coverage-aware crawling agents for mkvbase.
+
+Why: mkvbase hands out a sequential integer id per upload (newest /api/links
+rows are perfectly consecutive), so the vault's id histogram is an honest
+coverage meter: the site's total uploads ~= max id seen, and blocks of ids
+with few stored rows are the eras we are missing.
+
+What: background agents (MKV_IDGAP_AGENTS, default 2) that
+  1. MEASURE id coverage per MKV_IDGAP_BLOCK-sized block (default 25000)
+  2. Pick the thinnest blocks and map ids -> upload dates (via rows we hold)
+  3. Turn those eras into targeted search terms (year, year+month, OTT facets,
+     letter+year slices) and run them through the SAME client as discovery,
+     so results merge into the SAME deduplicated vault (no duplicate rows can
+     ever be created — Mongo keys rows by id:url:title)
+
+Design: does NOT touch Discovery's queue/state. Fully independent lane,
+observable under its own name in logs: [idgap:a1/block]. Status dump goes to
+data/idgap_state.json so you can SEE it is running and what it is doing.
+
+Run inside the pusher (default on when Mongo is configured): the pusher starts
+it next to Discovery. Or standalone:  python -m app.idgap
+"""
+from __future__ import annotations
+
+import json
+import os
+import random
+import threading
+import time
+from collections import Counter
+from datetime import date, timedelta
+
+from .client import MkvbaseClient
+from .store import make_index
+
+_OTTS = ("zee5", "amzn", "nf", "hotstar", "sonyliv", "hoichoi", "aha",
+         "mx player", "sun nxt", "prime")
+_QUALS = ("1080p", "720p", "480p", "2160p", "10bit", "hevc")
+_LANGS = ("hindi", "tamil", "telugu", "malayalam", "kannada", "english", "multi")
+_ALPHA = "abcdefghijklmnopqrstuvwxyz"
+
+
+class IdGapMiner:
+    """Targets the thinnest id-blocks with era-appropriate search terms."""
+
+    def __init__(self, client: MkvbaseClient, index, state_dir: str):
+        self.client = client
+        self.index = index
+        self.state_path = os.path.join(state_dir, "idgap_state.json")
+        self.block = max(5000, int(os.getenv("MKV_IDGAP_BLOCK", "25000")))
+        self.agents_n = max(1, int(os.getenv("MKV_IDGAP_AGENTS", "2")))
+        self.gap_s = float(os.getenv("MKV_IDGAP_GAP_S", "12"))
+        # A block counts as full when it holds >= FULL_PCT of its id-space
+        # (ids ~= uploads, so a fully-crawled 25k block would hold ~25k rows).
+        self.full_pct = float(os.getenv("MKV_IDGAP_BLOCK_FULL_PCT", "0.6"))
+        self.round_every_s = float(os.getenv("MKV_IDGAP_ROUND_S", str(6 * 3600)))
+        # runtime state (persisted so restarts do not redo finished blocks)
+        self.done_blocks: set[int] = set()
+        self.searched_terms: dict[str, float] = {}
+        self.round_started = 0.0
+        self.stats = {"rounds": 0, "terms_done": 0, "rows_new": 0,
+                      "coverage_last": None, "plan": [], "picked_block": None,
+                      "picked_era": None}
+        self._load()
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------ state
+    def _load(self) -> None:
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                d = json.load(f)
+            self.done_blocks = {int(b) for b in d.get("done_blocks", [])}
+            self.searched_terms = {k: float(v) for k, v in
+                                   (d.get("searched_terms") or {}).items()}
+            self.round_started = float(d.get("round_started") or 0)
+            self.stats.update(d.get("stats") or {})
+        except Exception:
+            pass
+
+    def save(self) -> None:
+        with self._lock:
+            try:
+                os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+                with open(self.state_path, "w", encoding="utf-8") as f:
+                    json.dump({"done_blocks": sorted(self.done_blocks)[-500:],
+                               "searched_terms": self.searched_terms,
+                               "round_started": self.round_started,
+                               "stats": self.stats}, f)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ coverage
+    def _col(self):
+        return getattr(self.index, "_col", None)
+
+    def coverage(self) -> dict:
+        """Id-block coverage of the vault + id->date map from stored rows."""
+        col = self._col()
+        if col is None:
+            return {}
+        mx = (col.find_one(sort=[("id", -1)]) or {}).get("id")
+        if not mx:
+            return {}
+        b = self.block
+        counts: Counter = Counter()
+        id_dates: dict[int, str] = {}
+        for r in col.find({"id": {"$ne": None}},
+                          {"id": 1, "created_at": 1}):
+            counts[r["id"] // b] += 1
+            d = str(r.get("created_at") or "")[:10]
+            if d:
+                id_dates[r["id"] // b] = d  # any row in the block dates the era
+        total = sum(counts.values())
+        plan = []
+        full_n = int(self.block * self.full_pct)
+        for blk in range(0, mx // b + 1):
+            n = counts.get(blk, 0)
+            if n >= full_n or blk in self.done_blocks:
+                continue
+            plan.append({"block": blk, "have": n, "fill_pct": round(100 * n / b, 1),
+                         "block_start": blk * b,
+                         "era_date": self._era_date(blk, id_dates)})
+        plan.sort(key=lambda x: (x["have"], -x["block"]))
+        cov = round(100 * total / max(1, mx), 1)
+        with self._lock:
+            self.stats["coverage_last"] = cov
+            self.stats["plan"] = plan[:8]
+        return {"total_rows": total, "max_id": mx, "coverage_pct": cov,
+                "thin_blocks": plan}
+
+    def _era_date(self, blk: int, id_dates: dict[int, str]) -> str:
+        """Best-known date for a block: nearest measured neighbor block."""
+        for off in range(1, 12):
+            for nb in (blk - off, blk + off):
+                if nb in id_dates:
+                    return id_dates[nb]
+        return ""
+
+    # ------------------------------------------------------------ term plan
+    def _terms_for_era(self, era: str) -> list[str]:
+        """Era (date str) -> targeted search terms. Lean: every term must earn
+        its request, deduped against this miner's own history."""
+        out: list[str] = []
+        try:
+            d = date.fromisoformat(era)
+        except Exception:
+            d = None
+        years = []
+        if d:
+            years = [str(d.year), str(d.year - 1)]
+        else:
+            years = ["2025", "2026"]
+        for y in years:
+            out.append(y)
+            for m in ("jan", "feb", "mar", "apr", "may", "jun",
+                      "jul", "aug", "sep", "oct", "nov", "dec"):
+                out.append(f"{y} {m}")
+            for ot in _OTTS:
+                out.append(f"{y} {ot}")
+            for q in _QUALS:
+                out.append(f"{y} {q}")
+            for l in _LANGS:
+                out.append(f"{y} {l}")
+        for a in _ALPHA:
+            out.append(f"{a} {years[0]}")
+        return out
+
+    def _next_terms(self, n: int) -> tuple[int | None, str, list[str]]:
+        cov = self.coverage()
+        if not cov or not cov["thin_blocks"]:
+            return None, "", []
+        blk_info = cov["thin_blocks"][0]
+        blk = blk_info["block"]
+        era = blk_info.get("era_date") or ""
+        with self._lock:
+            self.stats["picked_block"] = blk_info["block_start"]
+            self.stats["picked_era"] = era
+        pool = self._terms_for_era(era)
+        now = time.time()
+        fresh = [t for t in pool
+                 if now - self.searched_terms.get(t, 0) > 20 * 3600]
+        random.shuffle(fresh)
+        return blk, era, fresh[:n]
+
+    # ------------------------------------------------------------ loop
+    def step(self, agent: str = "a1") -> dict:
+        blk, era, terms = self._next_terms(1)
+        if not terms:
+            # every thin block worked this round — sleep until the next round
+            return {"status": "idle", "agent": agent}
+        term = terms[0]
+        t0 = time.time()
+        try:
+            obj = self.client.search(term)
+        except Exception as e:
+            self.searched_terms[term] = time.time() - 18 * 3600  # retry sooner
+            self.save()
+            return {"status": "retry", "term": term, "agent": agent,
+                    "err": f"{type(e).__name__}: {str(e)[:100]}"}
+        rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
+        new, _upd = self.index.upsert(rows, source=f"idgap:{agent}:b{blk}")
+        with self._lock:
+            self.stats["terms_done"] += 1
+            self.stats["rows_new"] += new
+        self.searched_terms[term] = time.time()
+        # a block is done when this term-plan for its era is exhausted
+        if len([t for t in self._terms_for_era(era)
+                if time.time() - self.searched_terms.get(t, 0) > 20 * 3600]) == 0:
+            self.done_blocks.add(blk)
+        self.save()
+        return {"status": "ok", "term": term, "agent": agent, "block": blk,
+                "era": era, "rows": len(rows), "new": new,
+                "took_s": round(time.time() - t0, 1)}
+
+    def run(self, log=print, stop: threading.Event | None = None) -> None:
+        stop = stop or threading.Event()
+
+        def agent_loop(idx: int) -> None:
+            agent = f"a{idx}"
+            while not stop.is_set():
+                try:
+                    info = self.step(agent)
+                    if info.get("status") == "ok":
+                        log(f"[idgap:{agent}] ok {info['term']!r} block={info['block']} "
+                            f"era={info['era']}: {info['rows']} rows, {info['new']} new "
+                            f"({info['took_s']}s)  cov={self.stats.get('coverage_last')}%",
+                            flush=True)
+                    elif info.get("status") == "retry":
+                        log(f"[idgap:{agent}] RETRY {info.get('term')}: "
+                            f"{info.get('err')}", flush=True)
+                        stop.wait(self.gap_s * 2)
+                    else:
+                        stop.wait(300)  # idle: round complete
+                except Exception as e:
+                    log(f"[idgap:{agent}] error {type(e).__name__}: {str(e)[:120]}",
+                        flush=True)
+                    stop.wait(30)
+
+        threads = [threading.Thread(target=agent_loop, args=(i,), daemon=True,
+                                    name=f"idgap-{i}") for i in range(1, self.agents_n + 1)]
+        for t in threads:
+            t.start()
+
+    def status_line(self) -> str:
+        with self._lock:
+            s = self.stats
+            return (f"rounds={s['rounds']} terms={s['terms_done']} "
+                    f"new_rows={s['rows_new']} cov={s.get('coverage_last')}% "
+                    f"block={s.get('picked_block')} era={s.get('picked_era')}")
+
+
+def start_idgap(client: MkvbaseClient, state_dir: str, log=print) -> IdGapMiner | None:
+    """Start the miner when a durable index exists; None otherwise (file index
+    would never reach Render). Called by the pusher at startup."""
+    idx = make_index(state_dir)
+    if idx.stats().get("backend") != "mongodb":
+        log("[idgap] DISABLED: MongoDB not configured", flush=True)
+        return None
+    miner = IdGapMiner(client, idx, state_dir)
+    miner.run(log=log)
+    log(f"[idgap] online: agents={miner.agents_n} block={miner.block} "
+        f"gap={miner.gap_s:.0f}s", flush=True)
+    return miner
+
+
+if __name__ == "__main__":
+    # standalone: python -m app.idgap
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", default=os.getenv("MKV_DATA_DIR", "data"))
+    args = ap.parse_args()
+    from .client import MkvbaseClient
+    from .engines import make_engine
+    cli = MkvbaseClient(make_engine(), cache_path=os.path.join(args.data_dir, "pusher"))
+    m = start_idgap(cli, args.data_dir)
+    if m:
+        cov = m.coverage()
+        print("coverage now:", cov.get("coverage_pct"), "% | thin blocks:",
+              [b["block_start"] for b in (cov.get("thin_blocks") or [])[:6]])
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            pass
