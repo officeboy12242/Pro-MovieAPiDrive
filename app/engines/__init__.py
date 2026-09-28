@@ -1,4 +1,8 @@
-"""Engine factory — pick by name or auto-detect what's installed."""
+"""Engine factory — pick by name or auto-detect what's installed.
+
+Default is a HEADLESS browser so Cloudflare clearance never pops a window
+over the user's work. Set MKV_HEADLESS=false only when debugging a clear.
+"""
 from __future__ import annotations
 
 import os
@@ -7,12 +11,13 @@ from .base import BaseEngine
 from .drission_engine import DrissionPageEngine
 from .camoufox_engine import CamoufoxEngine
 
-AVAILABLE = ("drissionpage", "camoufox")
+AVAILABLE = ("camoufox", "drissionpage")
 
 
 def _headless_default() -> bool:
-    # visible browser clears CF more reliably; servers should set MKV_HEADLESS=true
-    return os.getenv("MKV_HEADLESS", "false").lower() in ("1", "true", "yes")
+    # Headless by default: invisible clearance (Camoufox is built for it).
+    # Opt OUT with MKV_HEADLESS=false / 0 / no when debugging.
+    return os.getenv("MKV_HEADLESS", "true").lower() not in ("0", "false", "no")
 
 
 def make_engine(name: str | None = None) -> BaseEngine:
@@ -22,8 +27,8 @@ def make_engine(name: str | None = None) -> BaseEngine:
                                   user_data_dir=os.getenv("MKV_CHROME_PROFILE"))
     if name == "camoufox":
         return CamoufoxEngine(headless=_headless_default(), proxy=os.getenv("MKV_PROXY") or None)
-    # auto: first library that imports wins
-    for candidate, cls in (("drissionpage", DrissionPageEngine), ("camoufox", CamoufoxEngine)):
+    # auto: camoufox first (anti-detect + headless-friendly), then drissionpage
+    for candidate, cls in (("camoufox", CamoufoxEngine), ("drissionpage", DrissionPageEngine)):
         try:
             __import__(cls.__module__.split(".")[0] if False else {
                 "drissionpage": "DrissionPage",

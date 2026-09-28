@@ -14,6 +14,9 @@ set MKV_DISCOVERY_VAULT_PULL=5000
 REM Cap concurrent mkvbase GETs — 10 agents used to stampede and kill cf_clearance
 set MKV_HTTP_CONCURRENCY=2
 set MKV_HTTP_GAP_S=0.4
+REM Headless Camoufox: Cloudflare verification runs invisibly (no popup windows)
+set MKV_ENGINE=camoufox
+set MKV_HEADLESS=true
 set /p MKV_SYNC_KEY=<data\sync_key.txt
 set /p MKV_MONGODB_URI=<data\mongo_uri.txt
 :loop
