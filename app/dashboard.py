@@ -424,7 +424,7 @@ async def live():
 
 
 _HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>mkvbase vault — control room</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PRONOOB DRIVE — control room</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 :root{--bg:#05070c;--panel:#0b101a;--panel2:#0d1320;--line:rgba(154,172,207,.10);
 --line2:rgba(154,172,207,.22);--txt:#eaeff8;--dim:#8a95ab;--faint:#5d6679;
@@ -554,8 +554,8 @@ footer a{color:var(--blu);text-decoration:none}
 </style></head><body>
 <header>
  <span class="dot"></span>
- <div class="logo">M</div>
- <span class="brand">mkvbase <small>control room</small></span>
+ <div class="logo">P</div>
+ <span class="brand">PRONOOB DRIVE <small>control room</small></span>
  <span class="pill" id="pill">connecting</span>
  <div id="hdr-right">
   <span class="badge" id="clockbadge" title="PC clock vs mkvbase server time — drift kills signed search URLs">clock <span class="num" id="clockv">—</span></span>
@@ -639,7 +639,7 @@ footer a{color:var(--blu);text-decoration:none}
   <div class="card"><h3>Crawler log</h3><div class="lg" id="log"></div></div>
  </div>
 </main>
-<footer>streamed live over server-sent events · read-only · <a href="/api/live">/api/live</a> ·
+<footer>PRONOOB DRIVE · vault streamed live over server-sent events · read-only · <a href="/api/live">/api/live</a> ·
  stop/start via STOP-all-crawlers.cmd / START-auto-everything.cmd</footer>
 <script>
 const $=id=>document.getElementById(id);
