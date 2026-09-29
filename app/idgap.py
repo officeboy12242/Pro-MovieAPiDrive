@@ -126,7 +126,11 @@ class IdGapMiner:
         col = self._col()
         if col is None:
             return {}
-        mx = (col.find_one(sort=[("id", -1)]) or {}).get("id")
+        # shard-aware when the index has an overflow cluster
+        cols = list(getattr(self.index, "cols", lambda: [col])())
+        get_mx = getattr(self.index, "max_id", None)
+        mx = (get_mx() if get_mx else
+              (col.find_one(sort=[("id", -1)]) or {}).get("id"))
         if not mx:
             return {}
         b = self.block
@@ -135,18 +139,21 @@ class IdGapMiner:
         # the 20s socket timeout — this returns ~25 rows in milliseconds).
         counts: Counter = Counter()
         id_dates: dict[int, str] = {}
-        for r in col.aggregate([
-                {"$match": {"id": {"$ne": None}}},
-                {"$group": {
-                    "_id": {"$floor": {"$divide": ["$id", b]}},
-                    "n": {"$sum": 1},
-                    "d": {"$max": "$created_at"},  # newest row dates the era
-                }}]):
-            blk = int(r["_id"])
-            counts[blk] = r["n"]
-            d = str(r.get("d") or "")[:10]
-            if d:
-                id_dates[blk] = d
+        for c in cols:
+            for r in c.aggregate([
+                    {"$match": {"id": {"$ne": None}}},
+                    {"$group": {
+                        "_id": {"$floor": {"$divide": ["$id", b]}},
+                        "n": {"$sum": 1},
+                        "d": {"$max": "$created_at"},  # newest row dates the era
+                    }}]):
+                blk = int(r["_id"])
+                counts[blk] += r["n"]
+                d = str(r.get("d") or "")[:10]
+                if d:
+                    prev = id_dates.get(blk)
+                    if not prev or d > prev:
+                        id_dates[blk] = d
         total = sum(counts.values())
         plan = []
         full_n = int(self.block * self.full_pct)

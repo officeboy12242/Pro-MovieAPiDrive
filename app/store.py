@@ -265,6 +265,57 @@ class MongoIndex:
         self._col.create_index("id")  # idgap block math + max-id lookups
         self._backfill_title_tokens()
         self._hits = 0
+        # --- overflow shard (cluster B) -------------------------------
+        # When the primary quota fills, new rows (site ids >= overflow min)
+        # route to a second Atlas cluster; reads merge both. Rows without a
+        # numeric id always stay on the primary.
+        self._col2 = None
+        self._overflow_min = int(os.getenv("MKV_MONGO_OVERFLOW_MIN_ID", "700000"))
+        uri2 = (os.getenv("MKV_MONGODB_URI2") or "").strip()
+        if not uri2:
+            p2 = os.path.join(os.getenv("MKV_DATA_DIR", "data"), "mongo_uri2.txt")
+            try:
+                uri2 = open(p2, encoding="utf-8").read().strip()
+            except Exception:
+                uri2 = ""
+        if uri2 and self._overflow_min > 0:
+            try:
+                self._client2 = MongoClient(uri2, serverSelectionTimeoutMS=8000,
+                                            socketTimeoutMS=20000, maxPoolSize=8)
+                self._col2 = self._client2[db or os.getenv("MKV_MONGO_DB", "mkvbase")].links
+                self._col2.create_index("_seq")
+                self._col2.create_index("title_tokens")
+                self._col2.create_index("id")
+                self._col2.estimated_document_count()  # fail fast if unreachable
+                print(f"[index] overflow shard armed: ids >= {self._overflow_min} "
+                      f"-> secondary cluster", flush=True)
+            except Exception as e:
+                print(f"[index] overflow shard unavailable ({type(e).__name__}); "
+                      f"primary only", flush=True)
+                self._col2 = None
+
+    # ---------------------------------------------------------- shard utils
+    def cols(self) -> list:
+        """All shards to read from (primary first)."""
+        return [self._col] if self._col2 is None else [self._col, self._col2]
+
+    def col_for_id(self, rid):
+        """Shard that owns a given site id."""
+        if self._col2 is None:
+            return self._col
+        try:
+            return self._col2 if int(rid) >= self._overflow_min else self._col
+        except Exception:
+            return self._col
+
+    def max_id(self):
+        """Newest site id across all shards."""
+        mx = 0
+        for c in self.cols():
+            v = (c.find_one(sort=[("id", -1)], projection={"id": 1}) or {}).get("id")
+            if v:
+                mx = max(mx, int(v))
+        return mx or None
 
     def _backfill_title_tokens(self) -> None:
         """One-time migration: rows written before title_tokens existed get the
@@ -298,38 +349,40 @@ class MongoIndex:
         return doc
 
     def upsert(self, rows: list[dict], source: str = "") -> tuple[int, int]:
-        """Merge rows by key; returns (rows_new, rows_updated). One bulk op per call."""
+        """Merge rows by key; returns (rows_new, rows_updated). Rows are routed
+        per site id when an overflow shard is armed (ids >= overflow min go to
+        the secondary cluster); one bulk op per target shard."""
         from pymongo import UpdateOne
-        ops, new, updated, now = [], 0, 0, time.time()
+        buckets: dict = {}
+        now = time.time()
         for row in rows or []:
             if not isinstance(row, dict):
                 continue
             key = _row_key(row)
             if key is None:
                 continue
-            ops.append(UpdateOne(
+            col = self.col_for_id(row.get("id"))
+            buckets.setdefault(id(col), (col, []))[1].append(UpdateOne(
                 {"_id": key},
                 [{"$set": {**self._doc(row, source, now),
                            "_seq": {"$ifNull": ["$_seq", now]},  # keep first-seen order
                            "_upd": now}}],
                 upsert=True))
-        if not ops:
-            return 0, 0
-        try:
-            res = self._col.bulk_write(ops, ordered=False)
-            new, updated = res.upserted_count, res.modified_count
-        except Exception:
-            # bulk_write counts can be off with retries; make the return exact
-            new, updated = 0, 0
-            for op in ops:
-                before = self._col.find_one({"_id": op._filter["_id"]}, {"_id": 1})
-                res = self._col.update_one(op._filter, op._document[0], upsert=True)
-                if res.upserted_count:
-                    new += 1
-                elif before is not None and res.modified_count:
-                    updated += 1
+        new = updated = 0
+        for col, ops in buckets.values():
+            try:
+                res = col.bulk_write(ops, ordered=False)
+                new, updated = new + res.upserted_count, updated + res.modified_count
+            except Exception:
+                # bulk_write counts can be off with retries; make the return exact
+                for op in ops:
+                    before = col.find_one({"_id": op._filter["_id"]}, {"_id": 1})
+                    res = col.update_one(op._filter, op._document[0], upsert=True)
+                    if res.upserted_count:
+                        new += 1
+                    elif before is not None and res.modified_count:
+                        updated += 1
         return new, updated
-
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
         """Newest-discovered-first rows, filtered exactly like the mkvbase site
         search: whitespace tokens, ALL must appear as whole tokens in the title.
@@ -338,10 +391,16 @@ class MongoIndex:
         self._hits += 1
         tokens = list({t.lower() for t in _site_tokens(q)})
         query = {"title_tokens": {"$all": tokens}} if tokens else {}
-        total = self._col.count_documents(query)
-        rows = list(self._col.find(query, {"_id": 0, "_seq": 0, "_upd": 0,
-                                           "title_tokens": 0})
-                    .sort("_seq", self._DESC).limit(max(0, limit)))
+        proj = {"_id": 0, "_upd": 0, "title_tokens": 0}
+        total, merged = 0, []
+        for col in self.cols():
+            total += col.count_documents(query)
+            merged.extend(col.find(query, proj).sort("_seq", self._DESC)
+                          .limit(max(0, limit)))
+        merged.sort(key=lambda r: r.get("_seq") or 0, reverse=True)
+        rows = merged[:max(0, limit)]
+        for r in rows:
+            r.pop("_seq", None)
         return {"count": total, "results": rows}
 
     def titles_on_created_day(self, day: str, limit: int = 300) -> list[str]:
@@ -350,15 +409,25 @@ class MongoIndex:
         if len(day) < 10:
             return []
         try:
-            cur = self._col.find(
-                {"created_at": {"$regex": f"^{day}"}},
-                {"title": 1, "_id": 0},
-            ).limit(max(0, limit))
-            return [str(r["title"]).strip() for r in cur if r.get("title")]
+            out = []
+            for col in self.cols():
+                cur = col.find(
+                    {"created_at": {"$regex": f"^{day}"}},
+                    {"title": 1, "_id": 0},
+                ).limit(max(0, limit) - len(out))
+                out.extend(str(r["title"]).strip() for r in cur if r.get("title"))
+                if len(out) >= limit:
+                    break
+            return out
         except Exception:
             return []
 
     def stats(self) -> dict:
-        return {"rows": self._col.estimated_document_count(),
-                "backend": "mongodb", "db": self._col.database.name,
-                "served": self._hits}
+        out = {"rows": sum(c.estimated_document_count() for c in self.cols()),
+               "backend": "mongodb", "db": self._col.database.name,
+               "served": self._hits}
+        if self._col2 is not None:
+            out["shards"] = 2
+            out["overflow_min_id"] = self._overflow_min
+            out["overflow_rows"] = self._col2.estimated_document_count()
+        return out

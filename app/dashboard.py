@@ -79,43 +79,50 @@ def _mongo_col_cached():
 
 
 # ---------------------------------------------------------------- data bits
-def _vault(col) -> dict:
-    if col is None:
+def _vault(col=None) -> dict:
+    idx = _get_idx()
+    if idx is None:
         return {"rows": None, "error": "mongo unreachable"}
     try:
-        rows = col.estimated_document_count()
-        mx = (col.find_one(sort=[("id", -1)], projection={"id": 1}) or {}).get("id")
+        cols = list(idx.cols())
+        rows = sum(c.estimated_document_count() for c in cols)
+        get_mx = getattr(idx, "max_id", None)
+        mx = get_mx() if get_mx else (cols[0].find_one(sort=[("id", -1)],
+                                                       projection={"id": 1}) or {}).get("id")
         out = {"rows": rows, "max_id": mx,
-               "coverage_pct": round(100 * rows / mx, 1) if mx else None}
+               "coverage_pct": round(100 * rows / mx, 1) if mx else None,
+               "shards": len(cols)}
         blocks, thin = [], []
-        try:
-            for r in col.aggregate([
-                    {"$match": {"id": {"$ne": None}}},
-                    {"$group": {"_id": {"$floor": {"$divide": ["$id", BLOCK]}},
-                                "n": {"$sum": 1}}}]):
-                b = {"block": int(r["_id"]), "n": r["n"]}
-                blocks.append(b)
-                if r["n"] < BLOCK * 0.6:
-                    thin.append(b)
-            blocks.sort(key=lambda x: x["block"])
-            thin.sort(key=lambda x: x["n"])
-            out["blocks"] = blocks
-            out["thin"] = [{"block": b["block"], "have": b["n"]} for b in thin[:5]]
-        except Exception:
-            pass
+        for c in cols:
+            try:
+                for r in c.aggregate([
+                        {"$match": {"id": {"$ne": None}}},
+                        {"$group": {"_id": {"$floor": {"$divide": ["$id", BLOCK]}},
+                                    "n": {"$sum": 1}}}]):
+                    b = {"block": int(r["_id"]), "n": r["n"]}
+                    blocks.append(b)
+                    if r["n"] < BLOCK * 0.6:
+                        thin.append(b)
+            except Exception:
+                pass
+        blocks.sort(key=lambda x: x["block"])
+        thin.sort(key=lambda x: x["n"])
+        out["blocks"] = blocks
+        out["thin"] = [{"block": b["block"], "have": b["n"]} for b in thin[:5]]
         return out
     except Exception as e:
         return {"rows": None, "error": type(e).__name__}
 
 
 def _sources(col, n: int = 2000) -> list[dict]:
-    if col is None:
-        return []
     counts: dict[str, int] = {}
     try:
-        for r in col.find({}, {"_src": 1}).sort("_seq", -1).limit(n):
-            src = (r.get("_src") or "unknown").split(":")[0]
-            counts[src] = counts.get(src, 0) + 1
+        cols = list(globals().get("_dash_idx").cols()) if globals().get("_dash_idx") \
+            else ([col] if col is not None else [])
+        for c in cols:
+            for r in c.find({}, {"_src": 1}).sort("_seq", -1).limit(n):
+                src = (r.get("_src") or "unknown").split(":")[0]
+                counts[src] = counts.get(src, 0) + 1
     except Exception:
         return []
     total = sum(counts.values()) or 1
@@ -124,16 +131,26 @@ def _sources(col, n: int = 2000) -> list[dict]:
 
 
 def _newest(col, n: int = 12) -> list[dict]:
-    if col is None:
+    cols = [col] if col is not None else []
+    try:
+        extra = list(globals().get("_dash_idx").cols())  # overflow shard too
+        for c in extra:
+            if c not in cols:
+                cols.append(c)
+    except Exception:
+        pass
+    if not cols:
         return []
     try:
         out = []
-        for r in col.find({}, {"id": 1, "title": 1, "_src": 1, "created_at": 1}
-                          ).sort("_seq", -1).limit(n):
-            out.append({"id": r.get("id"), "title": (r.get("title") or "")[:90],
-                        "src": (r.get("_src") or "").split(":")[0],
-                        "created_at": (r.get("created_at") or "")[:10]})
-        return out
+        for c in cols:
+            for r in c.find({}, {"id": 1, "title": 1, "_src": 1, "created_at": 1}
+                            ).sort("_seq", -1).limit(n):
+                out.append({"id": r.get("id"), "title": (r.get("title") or "")[:90],
+                            "src": (r.get("_src") or "").split(":")[0],
+                            "created_at": (r.get("created_at") or "")[:10]})
+        out.sort(key=lambda r: r.get("id") or 0, reverse=True)
+        return out[:n]
     except Exception:
         return []
 
@@ -373,10 +390,31 @@ def _rate(deq: deque, win_s: int = 300) -> float:
 
 
 # ----------------------------------------------------------------- sampler
+def _get_idx():
+    """Cached shard-aware MongoIndex (rebuilt only if it dies)."""
+    idx = globals().get("_dash_idx")
+    if idx is not None:
+        try:
+            idx.stats()
+            return idx
+        except Exception:
+            globals()["_dash_idx"] = None
+    try:
+        from app.store import make_index
+        idx = make_index(DATA_DIR)
+        if idx.stats().get("backend") == "mongodb":
+            globals()["_dash_idx"] = idx
+            return idx
+    except Exception:
+        pass
+    return None
+
+
 def _sample_once() -> None:
     global _latest, _tick_n, _skew_cache
     _drain_events()
-    col = _mongo_col_cached()
+    idx = _get_idx()
+    col = idx._col if idx is not None else None
     lines, log_age = _log_tail_bytes()
     snap = {
         "ts": time.time(),
@@ -783,7 +821,8 @@ function render(d){
   $('rowchips').innerHTML=`<span class="chip" title="newest id in the vault">vault id <b>${fmt(v.max_id)}</b></span>`+
    `<span class="chip" title="newest id seen on mkvbase.site${polled!=null?` (polled ${polled}s ago)`:''}">site id <b>${fmt(st.site_max_id||null)}</b></span>`+
    `<span class="chip" title="uploads on the site the vault has not caught yet">lag <b class="${lagCls}">${fmt(lag)}</b></span>`+
-   `<span class="chip">not yet mined <b class="a">${fmt(smax-v.rows)}</b></span>`;}
+   `<span class="chip">not yet mined <b class="a">${fmt(smax-v.rows)}</b></span>`+
+   (v.shards>1?'<span class="chip" title="overflow cluster B active for new ids"><b class="p">2 shards</b></span>':'');}
  else $('rowchips').innerHTML=`<span class="chip r">${v.error||''}</span>`;
  if(v.coverage_pct!=null){const p=v.coverage_pct;
   $('gring').style.strokeDasharray=`${(p/100*301.59).toFixed(1)} 302`;
