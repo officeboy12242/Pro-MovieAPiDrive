@@ -178,6 +178,39 @@ def _fleet_from_log(lines: list[str]) -> dict:
     return out
 
 
+def _dbstats(col) -> dict:
+    """Real MongoDB storage numbers: how much of the Atlas space is filled
+    and how much remains. fsUsed/fsFree (true cluster quota) when the server
+    reports them; otherwise WiredTiger disk usage vs MKV_MONGO_LIMIT_MB
+    (default 512 = Atlas free tier)."""
+    if col is None:
+        return {}
+    try:
+        db = col.database
+        s = db.command("collstats", col.name)
+        d = db.command("dbstats")
+        out = {
+            "disk_mb": round((s.get("storageSize") or 0) / 1e6, 1),
+            "idx_mb": round((d.get("indexSize") or
+                             sum((v or {}).get("size", 0) for v in
+                                 (s.get("indexSizes") or {}).values())) / 1e6, 1),
+            "data_mb": round((s.get("size") or 0) / 1e6, 1),
+            "avg_b": s.get("avgObjSize"),
+            "rows": s.get("count"),
+        }
+        if d.get("fsUsedSize") is not None:
+            used = d["fsUsedSize"] / 1e6
+            free = (d.get("fsFreeSize") or 0) / 1e6
+            out.update(used_mb=round(used, 1), total_mb=round(used + free, 1))
+        else:
+            limit = float(os.getenv("MKV_MONGO_LIMIT_MB", "512"))
+            used = out["disk_mb"] + out["idx_mb"]
+            out.update(used_mb=round(used, 1), total_mb=limit)
+        return out
+    except Exception:
+        return {}
+
+
 def _site_state() -> dict:
     """Newest id seen on the site (recorded by the pusher's recent watcher)."""
     try:
@@ -358,6 +391,7 @@ def _sample_once() -> None:
         "events": list(_events)[-30:],
         "health": {"ok_min": _rate(_ok_t), "fail_min": _rate(_fail_t)},
         "clock": _skew_cache,
+        "db": _latest.get("db") or {},
         "render": None,
         "sources": None,
     }
@@ -367,6 +401,10 @@ def _sample_once() -> None:
         snap["sources"] = _sources(col)
     else:
         snap["sources"] = _latest.get("sources")
+    if _tick_n % 4 == 1 or not _latest.get("db"):
+        snap["db"] = _dbstats(col)
+    else:
+        snap["db"] = _latest.get("db")
     if _tick_n % 6 == 0 or not _latest.get("render"):
         snap["render"] = _render_health()
     else:
@@ -491,6 +529,14 @@ main{max-width:1240px;margin:0 auto;padding:18px 20px 30px}
 .gpct{font-family:var(--mono);font-size:20px;font-weight:700;fill:var(--txt);letter-spacing:-.5px}
 .gsub{fill:var(--dim);font-size:9px;letter-spacing:.6px;text-transform:uppercase}
 .ring{transition:stroke-dasharray .9s ease}
+/* mongo storage */
+.dbrow{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.dbbar{flex:1;min-width:260px;height:22px;border-radius:8px;overflow:hidden;display:flex;
+ background:rgba(154,172,207,.07);border:1px solid var(--line)}
+.dbbar>div{height:100%;transition:width .8s ease}
+#dbdata{background:linear-gradient(90deg,#3b82f6,#60a5fa)}
+#dbidx{background:linear-gradient(90deg,#8b5cf6,#a78bfa)}
+#dbfree{background:transparent}
 /* heatmap */
 .hmwrap{position:relative}
 .hm{position:relative;height:120px;display:flex;align-items:flex-end;gap:5px;
@@ -593,6 +639,22 @@ footer a{color:var(--blu);text-decoration:none}
    <div class="statrow"><span class="lab">failure</span><span class="bar"><i id="barfail" style="background:var(--red)"></i></span><span class="val num" id="vfail">—</span></div>
    <div class="s" id="healthsub"></div></div>
  </div>
+
+ <div class="card full">
+  <h3>MongoDB atlas storage <span class="tag" id="dbtag">live from dbStats</span></h3>
+  <div class="dbrow">
+   <div style="min-width:130px">
+    <div class="v num" id="dbused">—<small> MB used</small></div>
+    <div class="s" id="dbpct"></div></div>
+   <div class="dbbar" title="data · indexes · free">
+    <div id="dbdata"></div><div id="dbidx"></div><div id="dbfree"></div></div>
+   <div class="chips" style="flex:2;min-width:300px;margin-top:0" id="dbchips"></div>
+  </div>
+  <div class="chips" style="margin-top:10px">
+   <span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--blu);margin-right:5px"></i>data</span>
+   <span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--pur);margin-right:5px"></i>indexes</span>
+   <span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:rgba(154,172,207,.25);margin-right:5px"></i>free</span>
+  </div></div>
 
  <div class="card full">
   <h3>Id-block fill rate <span class="tag">each bar = 25,000 site ids · dashed line = 60% target</span></h3>
@@ -743,6 +805,22 @@ function render(d){
  $('vok').textContent=String(okm);$('vfail').textContent=String(fm);
  $('healthsub').innerHTML=(okm===0&&fm>0)?'<b class="r">all crawls failing — check clock badge / session</b>':
   (fm>0?`<span class="a">${fm} failing — usually transient challenges</span>`:'all lanes healthy');
+ const db=d.db||{};
+ if(db.used_mb!=null&&db.total_mb){tween('dbused',(el,x)=>{el.innerHTML=fmt(x)+'<small> MB used</small>'},db.used_mb);
+  const uPct=Math.min(100,db.used_mb/db.total_mb*100);
+  const dPct=Math.min(uPct,(db.data_mb||0)/db.total_mb*100);
+  const iPct=Math.max(0,Math.min(uPct-dPct,(db.idx_mb||0)/db.total_mb*100));
+  $('dbdata').style.width=dPct+'%';$('dbidx').style.width=iPct+'%';
+  $('dbfree').style.width=Math.max(0,100-uPct)+'%';
+  const full=uPct>=90,r=uPct>=75&&uPct<90;
+  $('dbpct').innerHTML=`<b class="${full?'r':r?'a':'g'}">${uPct.toFixed(1)}%</b> of ${(db.total_mb/1024).toFixed(2)} GB quota`;
+  $('dbtag').textContent=full?'⚠ quota nearly full — raise Atlas tier':'live from dbStats';
+  $('dbchips').innerHTML=
+   `<span class="chip">rows <b>${fmt(db.rows)}</b></span>`+
+   `<span class="chip">data <b>${fmt(db.data_mb)} MB</b></span>`+
+   `<span class="chip">indexes <b>${fmt(db.idx_mb)} MB</b></span>`+
+   `<span class="chip">avg doc <b>${db.avg_b?Math.round(db.avg_b)+' B':'—'}</b></span>`+
+   `<span class="chip">free <b class="g">${fmt(db.total_mb-db.used_mb)} MB</b></span>`;}
  const ck=d.clock;
  if(ck){const s=ck.skew_s,a=Math.abs(s);
   $('clockv').textContent=(s>0?'+':'')+s+'s';
