@@ -1,4 +1,4 @@
-"""Live vault dashboard v3 — real-time crawler control-room page.
+"""Live vault dashboard v4 — real-time crawler control-room page.
 
   python -m app.dashboard            (env: MKV_DASHBOARD_PORT, default 8766)
 
@@ -6,11 +6,6 @@ Transport: server-sent events. ONE sampler thread polls Mongo + the crawler
 log every 3s, diffs it into a live event stream, and every browser gets the
 snapshot pushed instantly - no polling, no refresh. Row-count history persists
 to data/vault_history.json so velocity + the 24h chart survive restarts.
-
-Cards: vault rows + count-up, coverage gauge, push velocity, crawl health
-(ok/fail rates + PC-clock skew vs the site's own HTTP Date - clock drift is
-what silently kills signed search URLs), all-block id heatmap, 24h growth
-chart, live event feed, newest pushes, fleet lanes, source mix, log tail.
 
 Read-only. Safe to run next to the API server and the fleet.
 """
@@ -44,8 +39,8 @@ app = FastAPI(docs_url=None, redoc_url=None)
 _started = time.time()
 _latest: dict = {}
 _hist: list[list[float]] = []
-_events: deque = deque(maxlen=60)          # {ts, kind, text}
-_ok_t: deque = deque(maxlen=600)           # timestamps of ok crawls
+_events: deque = deque(maxlen=60)
+_ok_t: deque = deque(maxlen=600)
 _fail_t: deque = deque(maxlen=600)
 _log_off = 0
 _tick_n = 0
@@ -102,7 +97,7 @@ def _vault(col) -> dict:
                 if r["n"] < BLOCK * 0.6:
                     thin.append(b)
             blocks.sort(key=lambda x: x["block"])
-            thin.sort(key=lambda x: x["have"] if "have" in x else x["n"])
+            thin.sort(key=lambda x: x["n"])
             out["blocks"] = blocks
             out["thin"] = [{"block": b["block"], "have": b["n"]} for b in thin[:5]]
         except Exception:
@@ -222,9 +217,7 @@ def _clock_skew() -> dict | None:
             return _skew_cache
         from email.utils import parsedate_to_datetime
         server = parsedate_to_datetime(d).timestamp()
-        _skew_cache_local = {"skew_s": round(time.time() - server),
-                             "checked_at": time.time()}
-        return _skew_cache_local
+        return {"skew_s": round(time.time() - server), "checked_at": time.time()}
     except Exception:
         return _skew_cache
 
@@ -275,11 +268,10 @@ def _velocity() -> dict:
 
 # ------------------------------------------------------------ event stream
 def _consume_log_lines() -> list[str]:
-    """Incrementally read only NEW log bytes since the last tick."""
     global _log_off
     try:
         size = os.path.getsize(LOG_PATH)
-        if size < _log_off:            # rotated / truncated
+        if size < _log_off:
             _log_off = 0
         if size == _log_off:
             return []
@@ -422,109 +414,139 @@ async def live():
 _HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>mkvbase vault — control room</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#05070d;--card:rgba(15,20,32,.66);--card2:rgba(15,20,32,.9);
---bd:rgba(148,170,220,.10);--bd2:rgba(148,170,220,.22);--fg:#e8eefb;--dim:#7e8aa5;
---grn:#3ddc84;--amb:#ffb454;--red:#ff5c69;--blu:#6ea8ff;--pur:#b48cff;--cyn:#54d6ff;
---grad:linear-gradient(93deg,#6ea8ff,#b48cff 55%,#54d6ff)}
+:root{--bg:#05070c;--panel:#0b101a;--panel2:#0d1320;--line:rgba(154,172,207,.10);
+--line2:rgba(154,172,207,.22);--txt:#eaeff8;--dim:#8a95ab;--faint:#5d6679;
+--grn:#34d399;--amb:#fbbf24;--red:#f87171;--blu:#60a5fa;--pur:#a78bfa;--cyn:#22d3ee;
+--mono:'Cascadia Code',ui-monospace,'SF Mono',Consolas,monospace}
 *{box-sizing:border-box;margin:0}
-html{scrollbar-color:#2a3346 transparent}
-body{background:
- radial-gradient(900px 520px at 85% -8%,rgba(110,140,255,.13),transparent 60%),
- radial-gradient(800px 500px at -10% 105%,rgba(180,140,255,.10),transparent 60%),
- var(--bg);color:var(--fg);
- font:14px/1.5 'Segoe UI',system-ui,-apple-system,Roboto,sans-serif;min-height:100vh}
-.num,.lg,td{font-variant-numeric:tabular-nums}
-.num{font-family:'Cascadia Code',Consolas,ui-monospace,monospace}
-header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
- padding:13px 22px;background:rgba(5,7,13,.78);backdrop-filter:blur(14px);
- border-bottom:1px solid var(--bd)}
-.logo{width:26px;height:26px;border-radius:8px;background:var(--grad);
- display:grid;place-items:center;font-weight:900;font-size:13px;color:#05070d}
-.brand{font-weight:700;font-size:15px}
+html{scrollbar-color:#273043 transparent}
+body{background:radial-gradient(1000px 600px at 88% -12%,rgba(96,140,255,.08),transparent 62%),
+ var(--bg);color:var(--txt);font:14px/1.5 'Segoe UI',system-ui,-apple-system,Roboto,sans-serif;
+ min-height:100vh;-webkit-font-smoothing:antialiased}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:11px;
+ padding:0 22px;height:54px;background:rgba(5,7,12,.82);backdrop-filter:blur(14px);
+ border-bottom:1px solid var(--line)}
+.logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#60a5fa,#a78bfa);
+ display:grid;place-items:center;font-weight:800;font-size:13px;color:#05070c;flex:none}
+.brand{font-weight:650;font-size:14.5px}
 .brand small{color:var(--dim);font-weight:400;margin-left:7px;font-size:12px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--grn);animation:p 1.8s infinite}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--grn);flex:none;
+ animation:p 2s infinite}
 .dot.warn{background:var(--amb);animation:none}.dot.dead{background:var(--red);animation:none}
-@keyframes p{0%{box-shadow:0 0 0 0 rgba(61,220,132,.5)}70%{box-shadow:0 0 0 8px transparent}100%{box-shadow:0 0 0 0 transparent}}
-.pill{font-size:10px;font-weight:800;letter-spacing:1.4px;padding:4px 11px;border-radius:99px;
- border:1px solid rgba(61,220,132,.35);color:var(--grn);text-transform:uppercase}
-.pill.warn{border-color:rgba(255,180,84,.4);color:var(--amb)}
-.pill.dead{border-color:rgba(255,92,105,.45);color:var(--red)}
-#hdr-right{margin-left:auto;display:flex;gap:14px;color:var(--dim);font-size:12px;align-items:center}
-.badge{display:flex;gap:6px;align-items:center;font-size:11.5px;padding:3px 9px;
- border-radius:8px;border:1px solid var(--bd);background:rgba(15,20,32,.5)}
-.badge .num{color:var(--fg)}
-main{max-width:1220px;margin:18px auto 0;padding:0 20px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-bottom:14px}
-.card{position:relative;background:var(--card);border:1px solid var(--bd);border-radius:16px;
- padding:16px 18px;backdrop-filter:blur(8px);transition:border-color .25s,transform .25s}
-.card:hover{border-color:var(--bd2);transform:translateY(-1px)}
-.card h3{font-size:10.5px;text-transform:uppercase;letter-spacing:1.3px;color:var(--dim);
- margin-bottom:9px;display:flex;justify-content:space-between;align-items:center;font-weight:600}
-.card h3 .tag{text-transform:none;letter-spacing:.2px;font-weight:400;font-size:10.5px}
-.v{font-size:31px;font-weight:800;background:var(--grad);-webkit-background-clip:text;
- background-clip:text;color:transparent;line-height:1.05}
-.s{font-size:12px;color:var(--dim);margin-top:5px}
-.s b{color:var(--fg);font-weight:600}
+@keyframes p{0%{box-shadow:0 0 0 0 rgba(52,211,153,.45)}70%{box-shadow:0 0 0 7px transparent}
+100%{box-shadow:0 0 0 0 transparent}}
+.pill{font-size:10px;font-weight:700;letter-spacing:1.3px;padding:3px 10px;border-radius:99px;
+ border:1px solid rgba(52,211,153,.35);color:var(--grn);text-transform:uppercase}
+.pill.warn{border-color:rgba(251,191,36,.4);color:var(--amb)}
+.pill.dead{border-color:rgba(248,113,113,.45);color:var(--red)}
+#hdr-right{margin-left:auto;display:flex;gap:10px;color:var(--dim);font-size:12px;align-items:center}
+.badge{display:flex;gap:6px;align-items:center;font-size:11.5px;padding:3px 10px;
+ border-radius:8px;border:1px solid var(--line);background:rgba(11,16,26,.6)}
+main{max-width:1240px;margin:0 auto;padding:18px 20px 30px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:14px}
+@media(max-width:1080px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:620px){.grid{grid-template-columns:1fr}}
+.card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+ border-radius:14px;padding:16px 18px 14px;min-width:0}
+.card h3{font-size:10.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);
+ margin-bottom:10px;font-weight:600;display:flex;justify-content:space-between;gap:8px}
+.card h3 .tag{text-transform:none;letter-spacing:.1px;font-weight:400;font-size:10.5px;
+ color:var(--faint);text-align:right}
+.v{font-size:29px;font-weight:650;color:var(--txt);line-height:1.05;letter-spacing:-.8px}
+.v small{font-size:15px;font-weight:500;color:var(--dim);letter-spacing:0;margin-left:2px}
+.s{font-size:12px;color:var(--dim);margin-top:6px;line-height:1.5}
+.s b{color:var(--txt);font-weight:600}
 .g{color:var(--grn)}.a{color:var(--amb)}.b{color:var(--blu)}.p{color:var(--pur)}.r{color:var(--red)}.c{color:var(--cyn)}
-.delta{display:inline-block;margin-left:8px;font-size:12.5px;color:var(--grn);opacity:0}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.chip{font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid var(--line);
+ color:var(--dim);background:rgba(154,172,207,.04)}
+.chip b{color:var(--txt);font-weight:600}
+.delta{display:inline-block;margin-left:8px;font-size:12px;color:var(--grn);opacity:0;
+ transform:translateY(4px)}
 .delta.pop{animation:pop 2.6s ease-out}
-@keyframes pop{0%{opacity:0;transform:translateY(7px)}12%{opacity:1;transform:translateY(0)}80%{opacity:1}100%{opacity:0}}
-.gauge{display:flex;align-items:center;gap:14px}
-.gauge svg{flex:none}
-.gauge .ring{transition:stroke-dasharray .9s ease}
-.gauge .pct{font-size:24px;font-weight:800;fill:#e8eefb;font-family:'Cascadia Code',Consolas,monospace}
-.gauge .sub{fill:var(--dim);font-size:9px}
+@keyframes pop{0%{opacity:0;transform:translateY(5px)}15%{opacity:1;transform:none}
+80%{opacity:1}100%{opacity:0}}
+.statrow{display:flex;align-items:center;gap:8px;margin-top:7px;font-size:12px;color:var(--dim)}
+.statrow .lab{width:64px;flex:none}
+.statrow .bar{flex:1;height:4px;border-radius:99px;background:rgba(154,172,207,.1);overflow:hidden}
+.statrow .bar i{display:block;height:100%;border-radius:99px;transition:width .7s ease}
+.statrow .val{width:70px;flex:none;text-align:right;color:var(--txt);font-weight:600}
 .full{grid-column:1/-1}
-.hm{display:grid;grid-template-columns:repeat(auto-fill,minmax(52px,1fr));gap:7px;margin-top:4px}
-.cell{position:relative;border-radius:9px;padding:7px 4px 5px;text-align:center;
- border:1px solid var(--bd);background:rgba(255,255,255,.02);transition:transform .15s}
-.cell:hover{transform:scale(1.07);z-index:2}
-.cell .pc{font-size:13px;font-weight:700}
-.cell .bl{font-size:8.5px;color:var(--dim);letter-spacing:.3px}
-.cell.thin{border-color:rgba(255,92,105,.4);box-shadow:0 0 12px rgba(255,92,105,.15)}
-.cell.fullb{border-color:rgba(61,220,132,.35)}
-.legend{display:flex;gap:14px;margin-top:9px;font-size:10.5px;color:var(--dim);flex-wrap:wrap}
-.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:-1px}
-svg text{fill:var(--dim);font-size:10px;font-family:'Cascadia Code',Consolas,monospace}
+/* gauge */
+.gwrap{display:flex;align-items:center;gap:16px}
+.gwrap svg{flex:none}
+.gpct{font-family:var(--mono);font-size:20px;font-weight:700;fill:var(--txt);letter-spacing:-.5px}
+.gsub{fill:var(--dim);font-size:9px;letter-spacing:.6px;text-transform:uppercase}
+.ring{transition:stroke-dasharray .9s ease}
+/* heatmap */
+.hmwrap{position:relative}
+.hm{position:relative;height:120px;display:flex;align-items:flex-end;gap:5px;
+ margin-top:6px;margin-right:44px}
+.hline{position:absolute;left:0;right:0;border-top:1px dashed rgba(154,172,207,.13)}
+.hline span{position:absolute;right:-40px;top:-6px;font-size:9.5px;color:var(--faint);
+ font-family:var(--mono)}
+.htarget{position:absolute;left:0;right:0;border-top:1px dashed rgba(251,191,36,.5);z-index:2}
+.htarget span{position:absolute;right:-40px;top:-6px;font-size:9.5px;color:var(--amb);
+ font-family:var(--mono)}
+.hcol{flex:1;min-width:14px;max-width:44px;height:100%;display:flex;flex-direction:column;
+ justify-content:flex-end;position:relative;z-index:1}
+.hfill{width:100%;border-radius:5px 5px 1px 1px;opacity:.92;min-height:3px;
+ transition:height .8s ease}
+.hfill:hover{opacity:1}
+.hlabels{display:flex;gap:5px;margin-top:5px;margin-right:44px}
+.hlabels span{flex:1;min-width:14px;max-width:44px;text-align:center;font-size:9px;
+ color:var(--faint);font-family:var(--mono)}
+/* chart */
+.chartwrap{position:relative;padding-bottom:20px}
+.chartwrap svg{display:block;width:100%;height:170px}
+.ylab{position:absolute;right:0;font-size:10px;color:var(--faint);font-family:var(--mono);
+ transform:translateY(-50%);background:var(--panel2);padding:1px 4px;border-radius:4px}
+.xlab{position:absolute;left:0;right:0;bottom:0;display:flex;justify-content:space-between;
+ font-size:10px;color:var(--faint);font-family:var(--mono)}
+/* feeds */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:900px){.two{grid-template-columns:1fr}}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
-td,th{padding:5px 8px;border-bottom:1px solid rgba(148,170,220,.06);text-align:left;white-space:nowrap}
-th{color:var(--dim);font-weight:500;text-transform:uppercase;font-size:9.5px;letter-spacing:1px}
-td.t{white-space:normal;max-width:0;width:100%;overflow:hidden;text-overflow:ellipsis}
+td,th{padding:5px 8px;border-bottom:1px solid rgba(154,172,207,.06);text-align:left;
+ white-space:nowrap}
+th{color:var(--faint);font-weight:500;text-transform:uppercase;font-size:9.5px;letter-spacing:1px}
+td.t{white-space:normal;max-width:0;width:100%;overflow:hidden;text-overflow:ellipsis;color:#c6d0e2}
 tr.new td{animation:rowin 2.2s ease-out}
-@keyframes rowin{0%{background:rgba(61,220,132,.16)}100%{background:transparent}}
-.bar{display:flex;height:11px;border-radius:99px;overflow:hidden;margin-top:8px;background:rgba(148,170,220,.07)}
-.bar div{height:100%;transition:width .8s ease}
-.lg{font-size:11.5px;line-height:1.55;max-height:290px;overflow-y:auto;background:rgba(2,4,9,.65);
- border:1px solid var(--bd);border-radius:11px;padding:10px 12px;
- font-family:'Cascadia Code',Consolas,ui-monospace,monospace}
-.lg .d{color:var(--dim)}.lg .e{color:var(--red)}.lg .i{color:var(--grn)}.lg .m{color:var(--blu)}
-.feed{max-height:290px;overflow-y:auto;font-size:12.5px}
-.ev{display:flex;gap:9px;padding:5px 8px;border-radius:8px;align-items:baseline;
- border-left:2px solid transparent;animation:evin .4s ease}
-@keyframes evin{0%{opacity:0;transform:translateX(-6px)}100%{opacity:1;transform:none}}
-.ev .ts{color:var(--dim);font-size:10.5px;flex:none;width:60px}
-.ev.ok{border-left-color:var(--blu)} .ev.ok .tx b{color:var(--blu)}
-.ev.idgap{border-left-color:var(--pur)} .ev.idgap .tx b{color:var(--pur)}
-.ev.push{border-left-color:var(--grn)} .ev.push .tx b{color:var(--grn)}
-.ev.fail{border-left-color:var(--red);background:rgba(255,92,105,.05)} .ev.fail .tx{color:#ffb3b9}
+@keyframes rowin{0%{background:rgba(52,211,153,.14)}100%{background:transparent}}
+.feed{max-height:288px;overflow-y:auto;font-size:12.5px}
+.ev{display:flex;gap:9px;padding:4px 8px;border-radius:7px;align-items:baseline;
+ border-left:2px solid transparent}
+.ev .ts{color:var(--faint);font-size:10.5px;flex:none;width:52px;font-family:var(--mono)}
+.ev .tx{color:#c6d0e2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ev.ok{border-left-color:var(--blu)} .ev.ok .tx b{color:var(--blu);font-weight:600}
+.ev.idgap{border-left-color:var(--pur)} .ev.idgap .tx b{color:var(--pur);font-weight:600}
+.ev.push{border-left-color:var(--grn)} .ev.push .tx{color:var(--grn)}
+.ev.fail{border-left-color:var(--red);background:rgba(248,113,113,.06)}
+.ev.fail .tx{color:#fda4ab}
 .ev.info{border-left-color:var(--cyn)} .ev.info .tx{color:var(--cyn)}
-.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.lanes{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.lane{font-size:11px;padding:3px 10px;border-radius:99px;border:1px solid var(--bd);
- color:var(--dim);background:rgba(15,20,32,.5)}
-.lane b{color:var(--fg)}
-@media(max-width:900px){.two{grid-template-columns:1fr}.v{font-size:26px}
- #hdr-right{display:none}}
-footer{color:var(--dim);font-size:11.5px;text-align:center;margin-top:22px}
+.lg{font-size:11.5px;line-height:1.55;max-height:288px;overflow-y:auto;
+ background:rgba(2,4,9,.6);border:1px solid var(--line);border-radius:10px;
+ padding:9px 12px;font-family:var(--mono)}
+.lg .d{color:var(--faint)}.lg .e{color:var(--red)}.lg .i{color:var(--grn)}.lg .m{color:var(--blu)}
+.lanes{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.lane{font-size:11px;padding:2px 9px;border-radius:99px;border:1px solid var(--line);
+ color:var(--dim);background:rgba(154,172,207,.04)}
+.lane b{color:var(--txt);font-weight:600}
+.meter{display:flex;height:10px;border-radius:99px;overflow:hidden;margin-top:9px;
+ background:rgba(154,172,207,.08)}
+.meter div{height:100%;transition:width .8s ease}
+footer{color:var(--faint);font-size:11.5px;text-align:center;margin-top:8px}
 footer a{color:var(--blu);text-decoration:none}
+@media(max-width:620px){.v{font-size:24px}#hdr-right{display:none}}
 </style></head><body>
 <header>
  <span class="dot"></span>
  <div class="logo">M</div>
- <span class="brand">mkvbase <small>vault · control room</small></span>
+ <span class="brand">mkvbase <small>control room</small></span>
  <span class="pill" id="pill">connecting</span>
  <div id="hdr-right">
-  <span class="badge" id="clockbadge" title="PC clock vs mkvbase server time (signed URLs die when this drifts)">🖥 clock <span class="num" id="clockv">—</span></span>
+  <span class="badge" id="clockbadge" title="PC clock vs mkvbase server time — drift kills signed search URLs">clock <span class="num" id="clockv">—</span></span>
   <span class="badge num" id="pageup"></span>
  </div>
 </header>
@@ -532,73 +554,92 @@ footer a{color:var(--blu);text-decoration:none}
  <div class="grid">
   <div class="card"><h3>Vault rows <span class="tag">mongo atlas</span></h3>
    <div class="v num" id="rows">—</div><span class="delta num" id="rowsdelta"></span>
-   <div class="s" id="rowsub">connecting…</div></div>
+   <div class="chips" id="rowchips"></div></div>
   <div class="card"><h3>Site coverage</h3>
-   <div class="gauge">
-    <svg width="86" height="86" viewBox="0 0 86 86">
+   <div class="gwrap">
+    <svg width="108" height="108" viewBox="0 0 120 120">
      <defs><linearGradient id="gg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#6ea8ff"/><stop offset="1" stop-color="#b48cff"/></linearGradient></defs>
-     <circle cx="43" cy="43" r="36" fill="none" stroke="rgba(148,170,220,.12)" stroke-width="8"/>
-     <circle class="ring" id="gring" cx="43" cy="43" r="36" fill="none" stroke="url(#gg)"
-      stroke-width="8" stroke-linecap="round" stroke-dasharray="0 226"
-      transform="rotate(-90 43 43)"/>
-     <text class="pct" id="gpct" x="43" y="41" text-anchor="middle">—</text>
-     <text class="sub" x="43" y="55" text-anchor="middle">of site ids</text>
+      <stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
+     <circle cx="60" cy="60" r="48" fill="none" stroke="rgba(154,172,207,.12)" stroke-width="10"/>
+     <circle class="ring" id="gring" cx="60" cy="60" r="48" fill="none" stroke="url(#gg)"
+      stroke-width="10" stroke-linecap="round" stroke-dasharray="0 302"
+      transform="rotate(-90 60 60)"/>
+     <text class="gpct" id="gpct" x="60" y="58" text-anchor="middle">—</text>
+     <text class="gsub" x="60" y="76" text-anchor="middle">of ids</text>
     </svg>
-    <div class="s" id="covsub"></div></div></div>
+    <div style="min-width:0">
+     <div class="s" id="covsub"></div>
+     <div class="chips" id="covchips"></div></div></div></div>
   <div class="card"><h3>Push velocity</h3>
-   <div class="v num" id="rate">—</div><div class="s" id="ratesub">live rate</div></div>
-  <div class="card"><h3>Crawl health <span class="tag">last 5 min</span></h3>
-   <div class="v num" id="health">—</div><div class="s" id="healthsub">measuring…</div></div>
+   <div class="v num" id="rate">—<small> rows/min</small></div>
+   <div class="statrow"><span class="lab">last hour</span><span class="bar"><i id="barh1" style="background:var(--blu)"></i></span><span class="val num" id="vh1">—</span></div>
+   <div class="statrow"><span class="lab">24 hours</span><span class="bar"><i id="barh24" style="background:var(--pur)"></i></span><span class="val num" id="vh24">—</span></div>
+   <div class="s" id="ratesub"></div></div>
+  <div class="card"><h3>Crawl health <span class="tag">per min · 5m window</span></h3>
+   <div class="v num" id="health">—<small> ok/min</small></div>
+   <div class="statrow"><span class="lab">success</span><span class="bar"><i id="barok" style="background:var(--grn)"></i></span><span class="val num" id="vok">—</span></div>
+   <div class="statrow"><span class="lab">failure</span><span class="bar"><i id="barfail" style="background:var(--red)"></i></span><span class="val num" id="vfail">—</span></div>
+   <div class="s" id="healthsub"></div></div>
  </div>
 
- <div class="grid full"><div class="card">
-  <h3>Id-block heatmap <span class="tag" id="hmtag">25k ids per block · target ≥60% filled</span></h3>
-  <div class="hm" id="hm"></div>
-  <div class="legend"><span><i style="background:rgba(255,92,105,.75)"></i>&lt;15% full</span>
-   <span><i style="background:rgba(255,180,84,.75)"></i>15–40%</span>
-   <span><i style="background:rgba(84,214,255,.7)"></i>40–60%</span>
-   <span><i style="background:rgba(61,220,132,.8)"></i>≥60% (done)</span></div></div></div>
+ <div class="card full">
+  <h3>Id-block fill rate <span class="tag">each bar = 25,000 site ids · dashed line = 60% target</span></h3>
+  <div class="hmwrap">
+   <div class="hm" id="hm"></div>
+   <div class="hlabels" id="hmlabels"></div></div>
+  <div class="chips" style="margin-top:10px">
+   <span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--red);margin-right:5px"></i>&lt;15% full</span>
+   <span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--amb);margin-right:5px"></i>15–40%</span>
+   <span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--cyn);margin-right:5px"></i>40–60%</span>
+   <span class="chip"><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--grn);margin-right:5px"></i>≥60% done</span>
+   <span class="chip" id="hmthin" style="display:none"></span></div></div>
 
- <div class="grid full"><div class="card">
+ <div class="card full">
   <h3>Vault growth — 24h <span class="tag num" id="chartsum"></span></h3>
-  <svg id="chart" viewBox="0 0 600 132" width="100%" height="132" preserveAspectRatio="none">
-   <defs><linearGradient id="gr" x1="0" y1="0" x2="0" y2="1">
-    <stop offset="0" stop-color="#6ea8ff" stop-opacity=".4"/>
-    <stop offset="1" stop-color="#6ea8ff" stop-opacity="0"/></linearGradient></defs>
-  </svg></div></div>
+  <div class="chartwrap">
+   <div class="ylab" style="top:6px" id="ylmax">—</div>
+   <div class="ylab" style="top:50%" id="ylmid">—</div>
+   <div class="ylab" style="bottom:22px" id="ylmin">—</div>
+   <svg id="chart" viewBox="0 0 620 150" preserveAspectRatio="none">
+    <defs><linearGradient id="gr" x1="0" y1="0" x2="0" y2="1">
+     <stop offset="0" stop-color="#60a5fa" stop-opacity=".32"/>
+     <stop offset="1" stop-color="#60a5fa" stop-opacity="0"/></linearGradient></defs>
+   </svg>
+   <div class="xlab"><span>24h ago</span><span>now</span></div></div></div>
 
  <div class="two">
   <div class="card"><h3>Live events <span class="tag" id="evtag"></span></h3>
-   <div class="feed" id="feed"><div class="ev info"><span class="ts num">—</span><span class="tx">connecting…</span></div></div></div>
+   <div class="feed" id="feed"></div></div>
   <div class="card"><h3>Newest pushes → mongo</h3>
+   <div style="max-height:288px;overflow-y:auto">
    <table><thead><tr><th>id</th><th>title</th><th>src</th></tr></thead>
-   <tbody id="rowsfeed"><tr><td colspan=3 class="s">connecting…</td></tr></tbody></table></div>
+   <tbody id="rowsfeed"></tbody></table></div></div>
  </div>
 
- <div class="two" style="margin-top:14px">
+ <div class="two">
   <div class="card"><h3>Fleet <span class="tag" id="fleettag"></span></h3>
-   <div class="v" id="fleetv">—</div><div class="s" id="fleetsub"></div>
+   <div class="v" id="fleetv">—</div>
+   <div class="s" id="fleetsub"></div>
    <div class="lanes" id="lanes"></div>
-   <h3 style="margin-top:14px">Push sources <span class="tag" id="srcleg"></span></h3>
-   <div class="bar" id="srcbar"></div>
-   <div class="s" id="rendersub" style="margin-top:9px"></div></div>
+   <h3 style="margin-top:16px">Push sources <span class="tag" id="srcleg"></span></h3>
+   <div class="meter" id="srcbar"></div>
+   <div class="s" id="rendersub" style="margin-top:10px"></div></div>
   <div class="card"><h3>Crawler log</h3><div class="lg" id="log"></div></div>
  </div>
 </main>
-<footer>streamed live over server-sent events · read-only ·
- <a href="/api/live">/api/live</a> · stop/start via STOP-all-crawlers.cmd / START-auto-everything.cmd</footer>
+<footer>streamed live over server-sent events · read-only · <a href="/api/live">/api/live</a> ·
+ stop/start via STOP-all-crawlers.cmd / START-auto-everything.cmd</footer>
 <script>
 const $=id=>document.getElementById(id);
-const fmt=n=>n==null?'—':Math.round(n).toLocaleString();
-const kk=n=>n>=1000?(n/1000).toFixed(n>=10000?0:1)+'k':n;
-let cur={},prevRows=null,lastFeedId=null,prevLog='',prevHm='',lastOkSeen=0;
-/* count-up tween */
-function tween(id,fmtFn,target){const el=$(id);const from=(cur[id]===undefined?target:cur[id]);cur[id]=target;
- if(from===target){el.textContent=fmtFn(target);return}
- const t0=performance.now(),D=550;
+const fmt=n=>n==null?'—':Math.round(n).toLocaleString('en-US');
+let prevRows=null,lastFeedId=null,prevLog='',prevHm='',tweenSt={};
+function tween(id,set,target,dec=0){const el=$(id);
+ const from=(tweenSt[id]===undefined?target:tweenSt[id]);tweenSt[id]=target;
+ if(Math.abs(from-target)<1e-9){set(el,target);return}
+ const t0=performance.now(),D=500;
  (function fr(t){const p=Math.min(1,(t-t0)/D),e=1-Math.pow(1-p,3);
-  el.textContent=fmtFn(from+(target-from)*e);if(p<1)requestAnimationFrame(fr)})(t0);}
+  set(el,from+(target-from)*e);if(p<1)requestAnimationFrame(fr)})(t0);}
+const setNum=(el,x)=>el.firstChild?el.firstChild.nodeValue=fmt(x):el.textContent=fmt(x);
 function cls(l){if(/\bFAIL\b|\berror\b|Traceback/i.test(l))return'e';
  if(/\[alive\]|ok |READY|online|seeded/.test(l))return'i';
  if(/^\[discovery/.test(l))return'm';return'd';}
@@ -606,81 +647,108 @@ function chart(h){const s=$('chart');const base=s.innerHTML.split('<path')[0];
  if(!h||h.length<2){$('chartsum').textContent='collecting history…';s.innerHTML=base;return}
  const now=h[h.length-1][0],cut=now-86400e3;const pts=h.filter(p=>p[0]>=cut);
  if(pts.length<2){$('chartsum').textContent='collecting history…';s.innerHTML=base;return}
- const vs=pts.map(p=>p[1]),mn=Math.min(...vs),mx=Math.max(...vs);
- const W=600,H=132,pad=6,n=pts.length;
- const X=i=>i/(n-1)*W,Y=v=>H-pad-14-(v-mn)/((mx-mn)||1)*(H-2*pad-14);
+ const vs=pts.map(p=>p[1]);
+ let mn=Math.min(...vs),mx=Math.max(...vs);const span=(mx-mn)||1;mn-=span*.06;mx+=span*.06;
+ const L=2,R=612,T=10,B=140,n=pts.length;
+ const X=i=>L+(i/(n-1))*(R-L),Y=v=>T+(1-(v-mn)/(mx-mn))*(B-T);
  let d='M'+X(0).toFixed(1)+' '+Y(vs[0]).toFixed(1);
  for(let i=1;i<n;i++)d+=' L'+X(i).toFixed(1)+' '+Y(vs[i]).toFixed(1);
- const g=(t,x,y,anchor)=>`<text x="${x}" y="${y}"${anchor?` text-anchor="${anchor}"`:''}>${t}</text>`;
- s.innerHTML=base+`<path d="${d} L${W} ${H} L0 ${H} Z" fill="url(#gr)"/>`+
-  `<path d="${d}" fill="none" stroke="#6ea8ff" stroke-width="1.7"/>`+
-  g(fmt(mn),4,H-2)+g(fmt(mx),4,10)+g('24h ago',2,H-2)+g('now',W-24,H-2);
+ const grid=y=>`<line x1="${L}" y1="${y}" x2="${R}" y2="${y}" stroke="rgba(154,172,207,.09)" stroke-dasharray="3 4"/>`;
+ s.innerHTML=base+grid(T)+grid((T+B)/2)+grid(B)+
+  `<path d="${d} L${R} ${B} L${L} ${B} Z" fill="url(#gr)"/>`+
+  `<path d="${d}" fill="none" stroke="#60a5fa" stroke-width="1.6"/>`+
+  `<circle cx="${X(n-1)}" cy="${Y(vs[n-1])}" r="3" fill="#60a5fa"/>`+
+  `<circle cx="${X(n-1)}" cy="${Y(vs[n-1])}" r="7" fill="#60a5fa" opacity=".22"/>`;
+ $('ylmax').textContent=fmt(mx);$('ylmid').textContent=fmt((mx+mn)/2);$('ylmin').textContent=fmt(mn);
  const gain=vs[n-1]-vs[0];
- $('chartsum').textContent=gain>0?`+${fmt(gain)} rows / 24h`:'';}
+ $('chartsum').textContent=gain>0?`+${fmt(gain)} rows / 24h · now ${fmt(vs[n-1])}`:
+  `now ${fmt(vs[n-1])}`;}
 function heatmap(blocks){if(!blocks)return;const ser=JSON.stringify(blocks);
  if(ser===prevHm)return;prevHm=ser;
- $('hm').innerHTML=blocks.map(b=>{const p=Math.round(100*b.n/25000);
-  const col=p>=60?'rgba(61,220,132,.8)':p>=40?'rgba(84,214,255,.7)':
-            p>=15?'rgba(255,180,84,.75)':'rgba(255,92,105,.75)';
-  return `<div class="cell${p<60?(p<15?' thin':''):' fullb'}" title="ids ${fmt(b.block*25000)}–${fmt((b.block+1)*25000)} · ${fmt(b.n)}/25,000 rows (${p}%)">`+
-   `<div class="pc" style="color:${col}">${p}%</div><div class="bl num">${b.block*25}k</div></div>`}).join('');}
-function events(evs){if(!evs||!evs.length)return;
+ const band=p=>p>=60?'var(--grn)':p>=40?'var(--cyn)':p>=15?'var(--amb)':'var(--red)';
+ $('hm').innerHTML=
+  `<div class="hline" style="bottom:25%"><span>25</span></div>`+
+  `<div class="hline" style="bottom:50%"><span>50</span></div>`+
+  `<div class="hline" style="bottom:75%"><span>75</span></div>`+
+  `<div class="htarget" style="bottom:60%"><span>60</span></div>`+
+  blocks.map(b=>{const p=Math.min(100,Math.round(100*b.n/25000));
+   return `<div class="hcol" title="ids ${fmt(b.block*25000)}–${fmt((b.block+1)*25000-1)} · ${fmt(b.n)}/25,000 (${p}%)">`+
+    `<div class="hfill" style="height:${p}%;background:${band(p)}"></div></div>`}).join('');
+ $('hlabels').innerHTML=blocks.map(b=>`<span>${b.block*25}k</span>`).join('');
+ const thin=(blocks.map(b=>({b,p:Math.round(100*b.n/25000)})).filter(x=>x.p<60)
+  .sort((a,b)=>a.p-b.p).slice(0,3));
+ const ht=$('hmthin');
+ if(thin.length){ht.style.display='';
+  ht.innerHTML='thinnest: '+thin.map(x=>`<b class="r">${x.b.block*25}k · ${x.p}%</b>`).join(' · ')}
+ else ht.style.display='none';}
+function events(evs){if(!evs)return;
+ const now=Date.now()/1000;
  $('feed').innerHTML=evs.slice().reverse().map(e=>{
-  const t=new Date(e.ts*1000).toTimeString().slice(0,8);
+  const rel=now-e.ts,rs=rel<60?`${Math.round(rel)}s`:`${Math.floor(rel/60)}m`;
   const tx=e.text.replace(/</g,'&lt;').replace(/'([^']*)' \+(\d+)/,"'<b>$1</b>' <b>+$2</b>");
-  return `<div class="ev ${e.kind}"><span class="ts num">${t}</span><span class="tx">${tx}</span></div>`}).join('');
+  return `<div class="ev ${e.kind}"><span class="ts">${rs}</span><span class="tx">${tx}</span></div>`}).join('');
  $('evtag').textContent=evs.length+' recent';}
 function render(d){
  const ok=d.log_age_s!=null&&d.log_age_s>=0&&d.log_age_s<90;
  const dotEl=document.querySelector('.dot');
  if(dotEl)dotEl.className='dot'+(ok?'':(d.log_age_s<0?' dead':' warn'));
- const pill=$('pill'),h=d.health||{};
+ const pill=$('pill'),h=d.health||{ok_min:0,fail_min:0};
  if(h.ok_min===0&&h.fail_min>0){pill.textContent='crawls failing';pill.className='pill dead'}
  else if(!ok){pill.textContent='stale';pill.className='pill warn'}
  else{pill.textContent='live';pill.className='pill'}
  $('pageup').textContent=`page ${d.uptime_min||0}m · log ${d.log_age_s<0?'missing':d.log_age_s+'s'}`;
  const v=d.vault||{};
- if(v.rows!=null){tween('rows',fmt,v.rows);
+ if(v.rows!=null){tween('rows',setNum,v.rows);
   if(prevRows!=null&&v.rows>prevRows){const el=$('rowsdelta');
    el.textContent='+'+fmt(v.rows-prevRows);el.classList.remove('pop');void el.offsetWidth;el.classList.add('pop');}
-  prevRows=v.rows;$('rowsub').innerHTML=`<b>${fmt(v.max_id)}</b> newest site id · ${fmt((v.max_id||0)-v.rows)} not yet mined`;}
- else $('rowsub').textContent=v.error||'';
+  prevRows=v.rows;
+  $('rowchips').innerHTML=`<span class="chip">newest id <b>${fmt(v.max_id)}</b></span>`+
+   `<span class="chip">not yet mined <b class="a">${fmt((v.max_id||0)-v.rows)}</b></span>`;}
+ else $('rowchips').innerHTML=`<span class="chip r">${v.error||''}</span>`;
  if(v.coverage_pct!=null){const p=v.coverage_pct;
-  $('gring').style.strokeDasharray=`${p*2.26} 226`;
-  $('gpct').textContent=p+'%';
-  $('covsub').innerHTML='thinnest: '+(v.thin||[]).map(b=>`b${b.block*25}k(${fmt(b.have)})`).join(' ');}
- const vel=d.velocity||{};
- if(vel.per_min!=null)tween('rate',x=>'+'+(+x).toFixed(1),vel.per_min);
- $('ratesub').innerHTML=`rows/min · <b class="g">+${fmt(vel.h1)}</b> hour · <b class="b">+${fmt(vel.h24)}</b> 24h`;
- if(h.ok_min!=null||h.fail_min!=null){tween('health',x=>fmt(x),(h.ok_min||0));
-  $('healthsub').innerHTML=`<b class="g">${h.ok_min||0}</b> ok/min · <b class="${(h.fail_min||0)>0?'r':'g'}">${h.fail_min||0}</b> fail/min`+
-   ((h.ok_min===0&&h.fail_min>0)?' · <b class="r">crawl blocked!</b>':'');}
+  $('gring').style.strokeDasharray=`${(p/100*301.59).toFixed(1)} 302`;
+  $('gpct').textContent=p.toFixed(1)+'%';
+  $('covsub').innerHTML='of all site ids';
+  $('covchips').innerHTML=(v.thin||[]).slice(0,4).map(b=>
+   `<span class="chip">b${b.block*25}k <b>${fmt(b.have)}</b></span>`).join('');}
+ const vel=d.velocity||{per_min:null,h1:null,h24:null};
+ if(vel.per_min!=null)tween('rate',(el,x)=>{el.innerHTML=(x>=0?'+':'')+
+  (+x).toFixed(1)+'<small> rows/min</small>'},vel.per_min);
+ const mx=Math.max(vel.h1||0,vel.h24||0,1);
+ $('barh1').style.width=Math.min(100,(vel.h1||0)/mx*100)+'%';
+ $('barh24').style.width=Math.min(100,(vel.h24||0)/mx*100)+'%';
+ $('vh1').textContent='+'+fmt(vel.h1);$('vh24').textContent='+'+fmt(vel.h24);
+ $('ratesub').textContent=vel.per_min==null?'building history (5-min samples)…':'rolling 30-min average';
+ const okm=h.ok_min||0,fm=h.fail_min||0,den=Math.max(okm+fm,1);
+ tween('health',setNum,okm);
+ $('barok').style.width=(okm/den*100)+'%';$('barfail').style.width=(fm/den*100)+'%';
+ $('vok').textContent=String(okm);$('vfail').textContent=String(fm);
+ $('healthsub').innerHTML=(okm===0&&fm>0)?'<b class="r">all crawls failing — check clock badge / session</b>':
+  (fm>0?`<span class="a">${fm} failing — usually transient challenges</span>`:'all lanes healthy');
  const ck=d.clock;
  if(ck){const s=ck.skew_s,a=Math.abs(s);
   $('clockv').textContent=(s>0?'+':'')+s+'s';
-  $('clockv').className='num '+(a>120?'r':a>30?'a':'g');
-  $('clockbadge').title=a>30?'Clock drift! Signed search URLs will be REJECTED — resync Windows time':'PC clock vs mkvbase server time';}
+  $('clockv').style.color=a>120?'var(--red)':a>30?'var(--amb)':'var(--grn)';}
  heatmap(v.blocks);
  chart(d.history);
  events(d.events);
  const f=d.fleet||{};
  if(f.tick){$('fleetv').innerHTML=`${f.tick.agents} <span class="g">agents</span>`;
   $('fleetsub').innerHTML=`done <b>${fmt(f.tick.done)}</b> · queued <b>${fmt(f.tick.queued)}</b> · rows mined <b>${fmt(f.tick.rows)}</b>`;
-  $('fleettag').textContent='crawler uptime '+(f.uptime_min||0)+'m · session '+(f.session||'?');}
+  $('fleettag').textContent=`crawler up ${(f.uptime_min||0)}m · session ${f.session||'?'}`;}
  const lanes=f.lanes||{};
  $('lanes').innerHTML=Object.entries(lanes).map(([k,x])=>
-  `<span class="lane">${k} <b>${kk(x)}</b></span>`).join('')||'<span class="lane">waiting for fleet tick…</span>';
+  `<span class="lane">${k} <b>${x>=1000?(x/1000).toFixed(1)+'k':x}</b></span>`).join('');
  const t=d.idgap||{};
- $('fleetsub').innerHTML+=` · idgap <b class="p">+${fmt(t.new_rows)}</b>`;
- const cols=['#3ddc84','#6ea8ff','#b48cff','#ffb454','#ff5c69','#54d6ff'];
+ if(t.terms)$('fleetsub').innerHTML+=` · idgap <b class="p">+${fmt(t.new_rows)}</b>`;
+ const cols=['#34d399','#60a5fa','#a78bfa','#fbbf24','#f87171','#22d3ee'];
  $('srcbar').innerHTML=(d.sources||[]).map((s,i)=>
-  `<div style="width:${s.pct}%;background:${cols[i%6]}" title="${s.name}: ${fmt(s.n)}"></div>`).join('');
+  `<div style="width:${s.pct}%;background:${cols[i%6]}" title="${s.name}: ${fmt(s.n)} (${s.pct}%)"></div>`).join('');
  $('srcleg').textContent=(d.sources||[]).map(s=>`${s.name} ${s.pct}%`).join(' · ');
  $('rowsfeed').innerHTML=(d.newest||[]).map(x=>
   `<tr${x.id!==lastFeedId&&lastFeedId!=null&&x.id>lastFeedId?' class="new"':''}>`+
   `<td class="num">${x.id??''}</td><td class="t">${(x.title||'').replace(/</g,'&lt;')}</td>`+
-  `<td class="${x.src==='idgap'?'p':'b'}">${x.src||''}</td></tr>`).join('')
-  ||'<tr><td colspan=3 class=s>empty</td></tr>';
+  `<td class="${x.src==='idgap'?'p':'b'}">${x.src||''}</td></tr>`).join('');
  if(d.newest&&d.newest[0])lastFeedId=d.newest[0].id;
  const r=d.render;
  if(r){$('rendersub').innerHTML=r.ok?
