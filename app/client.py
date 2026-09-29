@@ -45,6 +45,53 @@ class NeedsSession(MkvbaseError):
     """Plain HTTP cannot proceed: no clearance yet, or Cloudflare clearance died."""
 
 
+class _PrioritySemaphore:
+    """A threading.Semaphore whose waiters wake in priority order (lower
+    value first) instead of FIFO. Keeps the 2-slot HTTP budget pointed at
+    the highest-yield lanes: the recents watcher never queues behind bulk
+    discovery, and idgap seed searches beat low-priority probes."""
+
+    def __init__(self, value: int = 1):
+        import heapq
+        self._heapq = heapq
+        self._cond = threading.Condition()
+        self._tokens = value
+        self._seq = 0
+        self._waiters: list = []  # heap of (priority, seq, event)
+
+    def acquire(self, priority: int = 3, timeout: float | None = None) -> bool:
+        with self._cond:
+            if self._tokens > 0 and not self._waiters:
+                self._tokens -= 1
+                return True
+            ev = threading.Event()
+            self._seq += 1
+            self._heapq.heappush(self._waiters, (priority, self._seq, ev))
+        # wait OUTSIDE the condition lock or release() can never run
+        ok = ev.wait(timeout) if timeout else ev.wait()
+        if not ok:  # timed out: remove ourselves so the token is not lost
+            with self._cond:
+                self._waiters = [w for w in self._waiters if w[2] is not ev]
+                self._heapq.heapify(self._waiters)
+        return ok
+
+    def release(self) -> None:
+        with self._cond:
+            if self._waiters:
+                _, _, ev = self._heapq.heappop(self._waiters)
+                ev.set()
+            else:
+                self._tokens += 1
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
 class MkvbaseClient:
     def __init__(self, engine: BaseEngine | None, base: str = BASE, cache_path: str | None = None):
         self._engine = engine  # created lazily on the engine thread when first needed
@@ -67,12 +114,27 @@ class MkvbaseClient:
         self._engine_tid: int | None = None
         # Multi-agent stampede kills cf_clearance: one clear at a time, few concurrent GETs.
         self._clear_lock = threading.Lock()
-        self._http_sem = threading.Semaphore(
+        self._http_sem = _PrioritySemaphore(
             max(1, int(os.getenv("MKV_HTTP_CONCURRENCY", "2"))))
         self._http_gap_s = float(os.getenv("MKV_HTTP_GAP_S", "0.4"))
         self._last_http_at = 0.0
         self._pace_lock = threading.Lock()
         self._load_persisted_session()
+
+    @staticmethod
+    def _lane_priority() -> int:
+        """Slot-queue priority by calling lane (lower wakes first):
+        0 recents watcher/sync -> 1 idgap miners -> 2 discovery priority
+        lane -> 3 everything else. Derives from the thread name, so callers
+        need no changes."""
+        n = threading.current_thread().name
+        if n == "MainThread" or n.startswith("mkv-"):
+            return 0
+        if n.startswith("idgap"):
+            return 1
+        if "-priority" in n:
+            return 2
+        return 3
 
     def _pace_http(self) -> None:
         """Small gap between plain-HTTP calls so CF does not rotate clearance."""
@@ -560,7 +622,7 @@ class MkvbaseClient:
 
         HTTP concurrency is capped so 10 discovery agents cannot stampede CF.
         """
-        self._http_sem.acquire()
+        self._http_sem.acquire(self._lane_priority())
         try:
             try:
                 return self._fetch_http(make_url), "http"
