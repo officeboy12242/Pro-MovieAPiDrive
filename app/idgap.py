@@ -207,8 +207,10 @@ class IdGapMiner:
             seen: set[str] = set()
             heads = [h for h in heads if not (h in seen or seen.add(h))]
             self._seed_cache[blk] = heads
-        fresh = [h for h in heads if h not in self.searched_terms]
-        return fresh[:n]
+        # ALL heads (not only unsearched ones): the caller applies the TTL/claim
+        # gate and the LRU valve. Filtering here made every block look empty
+        # once all its seeds had been tried, idling the miner for hours.
+        return heads[:800]
 
     # ------------------------------------------------------------ term plan
     def _term_kind(self, term: str) -> str:
@@ -255,39 +257,48 @@ class IdGapMiner:
         if not cov or not cov["thin_blocks"]:
             return None, "", []
         now = time.time()
-        # Walk the 5 thinnest blocks and pick the first with seed terms that
-        # were not searched recently (TTL gate), so one exhausted block cannot
-        # stall the miner. With 800 seeds/block there is nearly always work.
-        min_gap = float(os.getenv("MKV_IDGAP_SEED_MIN_GAP_S", "1200"))  # 20 min
-        best: tuple | None = None  # (last_searched_ts, blk, era, seeds)
+        # Walk the 5 thinnest blocks and CLAIM the first unclaimed fresh seed.
+        # Claims are atomically stamped into searched_terms (TTL now+90s grace
+        # so a failed search retries quickly), so two agents can never pick the
+        # same term no matter how many agents run.
+        claim_s = float(os.getenv("MKV_IDGAP_CLAIM_S", "90"))
+        best: tuple | None = None  # (stalest_seed_ts, blk, era, seeds)
         for blk_info in cov["thin_blocks"][:5]:
             blk = blk_info["block"]
             era = blk_info.get("era_date") or ""
             seeds = self._seeds_for_block(blk)
-            fresh = [s for s in seeds
-                     if now - self.searched_terms.get(s, 0) > self.term_ttl_s]
-            if fresh:
-                off = int(agent[1:]) if agent[1:].isdigit() else 0
-                rot = fresh[off % len(fresh):] + fresh[:off % len(fresh)]
+            with self._lock:
+                fresh = [s for s in seeds
+                         if now - self.searched_terms.get(s, 0) > self.term_ttl_s
+                         and now - self.searched_terms.get(s, 0) > claim_s]
+                if fresh:
+                    pick = fresh[0]
+                    self.searched_terms[pick] = now + claim_s  # claim: free in 90s if it fails
+                else:
+                    pick = None
+            if pick:
                 with self._lock:
                     self.stats["picked_block"] = blk_info["block_start"]
                     self.stats["picked_era"] = era
-                return blk, era, [f"seed:{s}" for s in rot[:n]]
+                return blk, era, [f"seed:{pick}"]
             # remember the block whose most-recently-searched seed is OLDEST
             lru = min((self.searched_terms.get(s, 0) for s in seeds), default=0)
             if best is None or lru < best[0]:
                 best = (lru, blk, era, seeds)
-        # nothing fully fresh: reuse the block with the STALEST seeds once its
-        # youngest seed is >= min_gap old (prevents hammering the same terms)
-        if best and now - best[0] >= min_gap:
+        # nothing fully fresh: CLAIM the globally stalest seed (>= min_gap old)
+        if best and best[3] and now - best[0] >= min_gap:
             _, blk, era, seeds = best
-            seeds = sorted(seeds, key=lambda s: self.searched_terms.get(s, 0))
-            off = int(agent[1:]) if agent[1:].isdigit() else 0
-            rot = seeds[off % len(seeds):] + seeds[:off % len(seeds)]
             with self._lock:
-                self.stats["picked_block"] = blk * self.block
-                self.stats["picked_era"] = era
-            return blk, era, [f"seed:{s}" for s in rot[:n]]
+                seeds = sorted(seeds, key=lambda s: self.searched_terms.get(s, 0))
+                pick = next((s for s in seeds
+                             if now - self.searched_terms.get(s, 0) > min_gap), None)
+                if pick:
+                    self.searched_terms[pick] = now + claim_s
+            if pick:
+                with self._lock:
+                    self.stats["picked_block"] = blk * self.block
+                    self.stats["picked_era"] = era
+                return blk, era, [f"seed:{pick}"]
         # last resort: era terms for the thinnest block
         blk_info = cov["thin_blocks"][0]
         blk, era = blk_info["block"], blk_info.get("era_date") or ""
@@ -318,6 +329,8 @@ class IdGapMiner:
             return {"status": "retry", "term": term, "agent": agent,
                     "err": f"{type(e).__name__}: {str(e)[:100]}"}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
+        # search succeeded: upgrade the 90s claim to the full TTL stamp
+        self.searched_terms[term] = time.time()
         new, _upd = self.index.upsert(rows, source=f"idgap:{agent}:b{blk}")
         in_block = sum(1 for r in rows
                        if blk is not None and blk * self.block <= (r.get("id") or 0)
@@ -329,7 +342,6 @@ class IdGapMiner:
         with self._lock:
             self.stats["terms_done"] += 1
             self.stats["rows_new"] += new
-        self.searched_terms[term] = time.time()
         self._seed_cache.pop(blk, None)  # refresh seeds after block work
         # a block is DONE only when it is actually full (fill_pct >= target);
         # term exhaustion never retires a block any more.
