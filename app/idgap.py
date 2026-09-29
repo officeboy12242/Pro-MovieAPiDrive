@@ -200,7 +200,7 @@ class IdGapMiner:
             heads = []
             for r in col.find({"id": {"$gte": blk * self.block,
                                       "$lt": (blk + 1) * self.block}},
-                              {"title": 1}).sort("id", -1).limit(300):
+                              {"title": 1}).sort("id", -1).limit(800):
                 h = _title_head(r.get("title") or "")
                 if h and len(h) >= 3:
                     heads.append(h)
@@ -255,23 +255,40 @@ class IdGapMiner:
         if not cov or not cov["thin_blocks"]:
             return None, "", []
         now = time.time()
-        # Walk the 5 thinnest blocks and pick the first with fresh seed terms,
-        # so one seed-exhausted block cannot stall the whole miner.
+        # Walk the 5 thinnest blocks and pick the first with seed terms that
+        # were not searched recently (TTL gate), so one exhausted block cannot
+        # stall the miner. With 800 seeds/block there is nearly always work.
+        min_gap = float(os.getenv("MKV_IDGAP_SEED_MIN_GAP_S", "1200"))  # 20 min
+        best: tuple | None = None  # (last_searched_ts, blk, era, seeds)
         for blk_info in cov["thin_blocks"][:5]:
             blk = blk_info["block"]
             era = blk_info.get("era_date") or ""
             seeds = self._seeds_for_block(blk)
-            fresh_seeds = [s for s in seeds
-                           if now - self.searched_terms.get(s, 0) > self.term_ttl_s]
-            if fresh_seeds:
-                # rotate per agent so 2+ miners never race the same seed
+            fresh = [s for s in seeds
+                     if now - self.searched_terms.get(s, 0) > self.term_ttl_s]
+            if fresh:
                 off = int(agent[1:]) if agent[1:].isdigit() else 0
-                rot = fresh_seeds[off % len(fresh_seeds):] + fresh_seeds[:off % len(fresh_seeds)]
+                rot = fresh[off % len(fresh):] + fresh[:off % len(fresh)]
                 with self._lock:
                     self.stats["picked_block"] = blk_info["block_start"]
                     self.stats["picked_era"] = era
                 return blk, era, [f"seed:{s}" for s in rot[:n]]
-        # fall back to era terms for the thinnest block
+            # remember the block whose most-recently-searched seed is OLDEST
+            lru = min((self.searched_terms.get(s, 0) for s in seeds), default=0)
+            if best is None or lru < best[0]:
+                best = (lru, blk, era, seeds)
+        # nothing fully fresh: reuse the block with the STALEST seeds once its
+        # youngest seed is >= min_gap old (prevents hammering the same terms)
+        if best and now - best[0] >= min_gap:
+            _, blk, era, seeds = best
+            seeds = sorted(seeds, key=lambda s: self.searched_terms.get(s, 0))
+            off = int(agent[1:]) if agent[1:].isdigit() else 0
+            rot = seeds[off % len(seeds):] + seeds[:off % len(seeds)]
+            with self._lock:
+                self.stats["picked_block"] = blk * self.block
+                self.stats["picked_era"] = era
+            return blk, era, [f"seed:{s}" for s in rot[:n]]
+        # last resort: era terms for the thinnest block
         blk_info = cov["thin_blocks"][0]
         blk, era = blk_info["block"], blk_info.get("era_date") or ""
         pool = self._terms_for_era(era)

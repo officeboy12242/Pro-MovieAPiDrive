@@ -28,9 +28,12 @@ if exist data\mongo_uri.txt set /p MKV_MONGODB_URI=<data\mongo_uri.txt
 set MKV_DATA_DIR=data
 set PYTHONIOENCODING=utf-8
 set PYTHONUTF8=1
-REM Multi-agent discovery: 10 bots simultaneous + day-walk (env in .env; kept
-REM here as defaults when .env is absent)
-if not defined MKV_DISCOVERY_AGENTS set MKV_DISCOVERY_AGENTS=10
+REM Discovery keeps only priority(trending) + day + year lanes; the rest of
+REM the fleet is idgap (seed-heads mine alpha/words/facet content faster)
+if not defined MKV_DISCOVERY_AGENTS set MKV_DISCOVERY_AGENTS=3
+REM idgap: 8 agents, 5s gap - slot priority + best new-rows-per-search
+if not defined MKV_IDGAP_AGENTS set MKV_IDGAP_AGENTS=8
+if not defined MKV_IDGAP_GAP_S set MKV_IDGAP_GAP_S=5
 if not defined MKV_DISCOVERY_GAP_S set MKV_DISCOVERY_GAP_S=15
 if not defined MKV_DISCOVERY_VAULT_PULL set MKV_DISCOVERY_VAULT_PULL=5000
 REM Cap concurrent mkvbase GETs - agents used to stampede and kill cf_clearance
