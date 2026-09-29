@@ -8,8 +8,8 @@ echo ============================================================
 
 echo.
 echo [FLEET] crawler processes on this PC
-powershell -NoProfile -Command "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*app.pusher*' }; if ($p) { Write-Output ('  RUNNING  - PID ' + ($p.ProcessId -join ', ')) } else { Write-Output '  OFF      - no crawler process (start: START-auto-everything.cmd)' }"
-powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -like '*run-crawler-loop*' -or $_.CommandLine -like '*run-pusher*' }) { Write-Output '  loop     - auto-restart loop active' } else { Write-Output '  loop     - not active' }"
+powershell -NoProfile -Command "$p = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*app.pusher*' }); if ($p.Count) { Write-Output ('  RUNNING  - PID ' + ($p.ProcessId -join ', ')) } else { Write-Output '  OFF      - no crawler process (start: START-auto-everything.cmd)' }"
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -match 'run-crawler-loop\.cmd|run-pusher\.cmd' }) { Write-Output '  loop     - auto-restart loop active' } else { Write-Output '  loop     - not active' }"
 
 echo.
 echo [AUTOSTART] at logon

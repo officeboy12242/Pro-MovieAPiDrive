@@ -12,11 +12,11 @@ if exist .env for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do set
 if exist data\mongo_uri.txt set /p MKV_MONGODB_URI=<data\mongo_uri.txt
 
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*app.pusher*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -like '*run-crawler-loop*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -match 'run-crawler-loop\.cmd|run-pusher\.cmd' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 timeout /t 2 /nobreak >nul
 
 echo [2/3] starting crawler loop (minimized)...
-start "mkvbase-crawler" /min cmd /c ""%~dp0run-crawler-loop.cmd""
+start "mkvbase-crawler" /min cmd /c ""%~dp0run-pusher.cmd""
 
 echo [3/3] checking...
 timeout /t 5 /nobreak >nul

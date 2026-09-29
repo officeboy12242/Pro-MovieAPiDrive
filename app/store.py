@@ -262,6 +262,7 @@ class MongoIndex:
         self._col = self._client[db or os.getenv("MKV_MONGO_DB", "mkvbase")].links
         self._col.create_index("_seq")  # first-seen order, for newest-first paging
         self._col.create_index("title_tokens")  # whole-token AND search
+        self._col.create_index("id")  # idgap block math + max-id lookups
         self._backfill_title_tokens()
         self._hits = 0
 

@@ -130,14 +130,23 @@ class IdGapMiner:
         if not mx:
             return {}
         b = self.block
+        # Server-side aggregation: one result row per block instead of
+        # streaming every vault row through Python (149k+ rows would blow
+        # the 20s socket timeout — this returns ~25 rows in milliseconds).
         counts: Counter = Counter()
         id_dates: dict[int, str] = {}
-        for r in col.find({"id": {"$ne": None}},
-                          {"id": 1, "created_at": 1}):
-            counts[r["id"] // b] += 1
-            d = str(r.get("created_at") or "")[:10]
+        for r in col.aggregate([
+                {"$match": {"id": {"$ne": None}}},
+                {"$group": {
+                    "_id": {"$floor": {"$divide": ["$id", b]}},
+                    "n": {"$sum": 1},
+                    "d": {"$max": "$created_at"},  # newest row dates the era
+                }}]):
+            blk = int(r["_id"])
+            counts[blk] = r["n"]
+            d = str(r.get("d") or "")[:10]
             if d:
-                id_dates[r["id"] // b] = d  # any row in the block dates the era
+                id_dates[blk] = d
         total = sum(counts.values())
         plan = []
         full_n = int(self.block * self.full_pct)
