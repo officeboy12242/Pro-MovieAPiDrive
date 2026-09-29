@@ -78,6 +78,9 @@ class IdGapMiner:
         # (ids ~= uploads, so a fully-crawled 25k block would hold ~25k rows).
         self.full_pct = float(os.getenv("MKV_IDGAP_BLOCK_FULL_PCT", "0.6"))
         self.round_every_s = float(os.getenv("MKV_IDGAP_ROUND_S", str(6 * 3600)))
+        # A searched term may be retried after this long (was 20h; that starved
+        # thin blocks whose whole seed list had been tried). Default 3h.
+        self.term_ttl_s = float(os.getenv("MKV_IDGAP_TERM_TTL_S", str(3 * 3600)))
         # runtime state (persisted so restarts do not redo finished blocks)
         self.done_blocks: set[int] = set()
         self.searched_terms: dict[str, float] = {}
@@ -159,8 +162,11 @@ class IdGapMiner:
         full_n = int(self.block * self.full_pct)
         for blk in range(0, mx // b + 1):
             n = counts.get(blk, 0)
-            if n >= full_n or blk in self.done_blocks:
-                continue
+            if n >= full_n:
+                continue  # actually full - nothing to mine
+            # NOTE: done_blocks no longer excludes a thin block. "Term plan
+            # exhausted" used to mark blocks done at 9-20% fill and idle the
+            # whole miner. Fill is the only exit now; the term TTL paces retries.
             plan.append({"block": blk, "have": n, "fill_pct": round(100 * n / b, 1),
                          "block_start": blk * b,
                          "era_date": self._era_date(blk, id_dates)})
@@ -244,36 +250,45 @@ class IdGapMiner:
             out.append(f"{a} {years[0]}")
         return out
 
-    def _next_terms(self, n: int) -> tuple[int | None, str, list[str]]:
+    def _next_terms(self, n: int, agent: str = "a1") -> tuple[int | None, str, list[str]]:
         cov = self.coverage()
         if not cov or not cov["thin_blocks"]:
             return None, "", []
+        now = time.time()
+        # Walk the 5 thinnest blocks and pick the first with fresh seed terms,
+        # so one seed-exhausted block cannot stall the whole miner.
+        for blk_info in cov["thin_blocks"][:5]:
+            blk = blk_info["block"]
+            era = blk_info.get("era_date") or ""
+            seeds = self._seeds_for_block(blk)
+            fresh_seeds = [s for s in seeds
+                           if now - self.searched_terms.get(s, 0) > self.term_ttl_s]
+            if fresh_seeds:
+                # rotate per agent so 2+ miners never race the same seed
+                off = int(agent[1:]) if agent[1:].isdigit() else 0
+                rot = fresh_seeds[off % len(fresh_seeds):] + fresh_seeds[:off % len(fresh_seeds)]
+                with self._lock:
+                    self.stats["picked_block"] = blk_info["block_start"]
+                    self.stats["picked_era"] = era
+                return blk, era, [f"seed:{s}" for s in rot[:n]]
+        # fall back to era terms for the thinnest block
         blk_info = cov["thin_blocks"][0]
-        blk = blk_info["block"]
-        era = blk_info.get("era_date") or ""
+        blk, era = blk_info["block"], blk_info.get("era_date") or ""
+        pool = self._terms_for_era(era)
+        fresh = [t for t in pool
+                 if now - self.searched_terms.get(t, 0) > self.term_ttl_s]
+        random.shuffle(fresh)
         with self._lock:
             self.stats["picked_block"] = blk_info["block_start"]
             self.stats["picked_era"] = era
-        pool = self._terms_for_era(era)
-        now = time.time()
-        fresh = [t for t in pool
-                 if now - self.searched_terms.get(t, 0) > 20 * 3600]
-        random.shuffle(fresh)
         return blk, era, fresh[:n]
 
     # ------------------------------------------------------------ loop
     def step(self, agent: str = "a1") -> dict:
-        # 1) seeds first: exact title-heads from rows inside the thin block
-        blk, era, terms = self._next_terms(0)
-        if blk is not None:
-            seeds = self._seeds_for_block(blk)
-            if seeds:
-                terms = [f"seed:{s}" for s in seeds]
+        # seeds first (multi-block aware), then era terms as fallback
+        blk, era, terms = self._next_terms(3, agent)
         if not terms:
-            _b, _e, era_terms = self._next_terms(1)
-            if not era_terms:
-                return {"status": "idle", "agent": agent}
-            blk, era, terms = _b, _e, era_terms
+            return {"status": "idle", "agent": agent}
         raw = terms[0]
         term = raw[5:] if raw.startswith("seed:") else raw
         kind = self._term_kind(term)
@@ -299,11 +314,8 @@ class IdGapMiner:
             self.stats["rows_new"] += new
         self.searched_terms[term] = time.time()
         self._seed_cache.pop(blk, None)  # refresh seeds after block work
-        # a block is done when this term-plan for its era is exhausted
-        if len([t for t in self._terms_for_era(era)
-                if time.time() - self.searched_terms.get(t, 0) > 20 * 3600]) == 0 \
-                and not self._seeds_for_block(blk):
-            self.done_blocks.add(blk)
+        # a block is DONE only when it is actually full (fill_pct >= target);
+        # term exhaustion never retires a block any more.
         self.save()
         return {"status": "ok", "term": term, "kind": kind, "agent": agent,
                 "block": blk, "era": era, "rows": len(rows), "new": new,
@@ -328,7 +340,9 @@ class IdGapMiner:
                             f"{info.get('err')}", flush=True)
                         stop.wait(self.gap_s * 2)
                     else:
-                        stop.wait(300)  # idle: round complete
+                        # idle only when EVERY thin block lacks fresh terms;
+                        # short sleep so new seeds (fresh crawls) get picked up fast
+                        stop.wait(45)
                 except Exception as e:
                     log(f"[idgap:{agent}] error {type(e).__name__}: {str(e)[:120]}",
                         flush=True)
