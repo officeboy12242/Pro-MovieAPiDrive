@@ -11,6 +11,8 @@ echo [FLEET] crawler processes on this PC
 powershell -NoProfile -Command "$p = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*app.pusher*' }); if ($p.Count) { Write-Output ('  RUNNING  - PID ' + ($p.ProcessId -join ', ')) } else { Write-Output '  OFF      - no crawler process (start: START-auto-everything.cmd)' }"
 powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -match 'run-crawler-loop\.cmd|run-pusher\.cmd' }) { Write-Output '  loop     - auto-restart loop active' } else { Write-Output '  loop     - not active' }"
 
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*app.dashboard*' }) { Write-Output '  dashboard - http://127.0.0.1:8766' } else { Write-Output '  dashboard - off (start: DASHBOARD.cmd)' }"
+
 echo.
 echo [AUTOSTART] at logon
 if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mkvbase-autostart.cmd" (echo   ENABLED  - fleet starts by itself at every logon) else if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mkvbase-autostart.cmd.disabled" (echo   disabled - won't start at logon) else (echo   not installed)

@@ -7,7 +7,7 @@ REM  Run again any time - safe to re-run.
 REM ============================================================
 echo [1/3] stopping pusher + restart loop...
 powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -match 'run-crawler-loop\.cmd|run-pusher\.cmd|start-pusher' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output ('  killed loop ' + $_.ProcessId) }"
-powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*app.pusher*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output ('  killed crawler ' + $_.ProcessId) }"
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and ($_.CommandLine -like '*app.pusher*' -or $_.CommandLine -like '*app.dashboard*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output ('  killed crawler ' + $_.ProcessId) }"
 
 echo [2/3] disabling logon autostart...
 if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mkvbase-autostart.cmd" (
