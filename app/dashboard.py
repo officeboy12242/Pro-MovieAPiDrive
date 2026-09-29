@@ -172,6 +172,9 @@ _LANES = re.compile(r"\[priority=(\d+) day=(\d+) year=(\d+) alpha=(\d+) "
                     r"words=(\d+) series=(\d+) facet=(\d+)\]")
 
 
+_IDGAP_ON = re.compile(r"\[idgap\] online: agents=(\d+)")
+
+
 def _fleet_from_log(lines: list[str]) -> dict:
     out: dict = {}
     for l in reversed(lines):
@@ -180,6 +183,10 @@ def _fleet_from_log(lines: list[str]) -> dict:
             if m:
                 out["uptime_min"] = int(m.group(1))
                 out["session"] = m.group(3)
+        if "idgap_agents" not in out:
+            m = _IDGAP_ON.search(l)
+            if m:
+                out["idgap_agents"] = int(m.group(1))
         if "tick" not in out and "[discovery] fleet tick" in l:
             m = _TICK.search(l)
             if m:
@@ -894,7 +901,8 @@ function render(d){
  chart(d.history);
  events(d.events);
  const f=d.fleet||{};
- if(f.tick){$('fleetv').innerHTML=`${f.tick.agents} <span class="g">agents</span>`;
+ if(f.tick){const tot=(f.tick.agents||0)+(f.idgap_agents||0);
+  $('fleetv').innerHTML=`${tot} <span class="g">agents</span> <small style="font-size:14px;color:var(--dim)">(${f.tick.agents} discovery + ${f.idgap_agents||0} idgap)</small>`;
   $('fleetsub').innerHTML=`done <b>${fmt(f.tick.done)}</b> · queued <b>${fmt(f.tick.queued)}</b> · rows mined <b>${fmt(f.tick.rows)}</b>`;
   $('fleettag').textContent=`crawler up ${(f.uptime_min||0)}m · session ${f.session||'?'}`;}
  const lanes=f.lanes||{};

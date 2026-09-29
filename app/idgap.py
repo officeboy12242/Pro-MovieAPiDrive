@@ -262,6 +262,7 @@ class IdGapMiner:
         # so a failed search retries quickly), so two agents can never pick the
         # same term no matter how many agents run.
         claim_s = float(os.getenv("MKV_IDGAP_CLAIM_S", "90"))
+        min_gap = float(os.getenv("MKV_IDGAP_SEED_MIN_GAP_S", "1200"))  # 20 min
         best: tuple | None = None  # (stalest_seed_ts, blk, era, seeds)
         for blk_info in cov["thin_blocks"][:5]:
             blk = blk_info["block"]

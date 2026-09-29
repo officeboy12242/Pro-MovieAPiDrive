@@ -31,9 +31,9 @@ set PYTHONUTF8=1
 REM Discovery keeps only priority(trending) + day + year lanes; the rest of
 REM the fleet is idgap (seed-heads mine alpha/words/facet content faster)
 if not defined MKV_DISCOVERY_AGENTS set MKV_DISCOVERY_AGENTS=3
-REM idgap: 8 agents, 5s gap - slot priority + best new-rows-per-search
-if not defined MKV_IDGAP_AGENTS set MKV_IDGAP_AGENTS=8
-if not defined MKV_IDGAP_GAP_S set MKV_IDGAP_GAP_S=5
+REM idgap: 12 agents, 4s gap - the bulk of the fleet, slot priority 1
+if not defined MKV_IDGAP_AGENTS set MKV_IDGAP_AGENTS=12
+if not defined MKV_IDGAP_GAP_S set MKV_IDGAP_GAP_S=4
 if not defined MKV_DISCOVERY_GAP_S set MKV_DISCOVERY_GAP_S=15
 if not defined MKV_DISCOVERY_VAULT_PULL set MKV_DISCOVERY_VAULT_PULL=5000
 REM Cap concurrent mkvbase GETs - agents used to stampede and kill cf_clearance
