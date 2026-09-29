@@ -139,8 +139,32 @@ class Pusher:
         self.seen.recent_ids = ids
         self.seen.terms[_RECENT_MARK] = time.time()
         self.seen.save()
+        # record the site's newest id for the dashboard's lag monitor
+        try:
+            smax = max(int(i) for i in ids if i is not None)
+        except Exception:
+            smax = 0
+        if smax:
+            self._record_site_max(smax)
         return (f"recent: vaulted {len(rows)} rows {push_bit}  "
                 f"({time.time() - t0:.1f}s)")
+
+    def _record_site_max(self, site_max: int) -> None:
+        """Persist the site's newest id (seen by the recent watcher) so the
+        dashboard can show vault-vs-site lag. Logs when it advances."""
+        path = os.path.join(os.path.dirname(self.seen.path) or ".", "site_state.json")
+        prev = 0
+        try:
+            prev = int(json.load(open(path, encoding="utf-8")).get("site_max_id") or 0)
+        except Exception:
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"site_max_id": site_max, "seen_at": time.time()}, f)
+        except Exception:
+            pass
+        if site_max > prev:
+            print(f"[site:max] {site_max} (+{site_max - prev} new on site)", flush=True)
 
     # ------------------------------------------------------------------ search loop
     def add_terms(self, terms: list[str]) -> None:

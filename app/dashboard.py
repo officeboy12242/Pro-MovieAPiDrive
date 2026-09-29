@@ -28,6 +28,7 @@ PORT = int(os.getenv("MKV_DASHBOARD_PORT", "8766"))
 SITE = os.getenv("MKV_BASE_URL", "https://mkvbase.site")
 LOG_PATH = os.path.join(DATA_DIR, "pusher.log")
 IDGAP_STATE = os.path.join(DATA_DIR, "idgap_state.json")
+SITE_STATE = os.path.join(DATA_DIR, "site_state.json")  # site max id (pusher watcher)
 HIST_PATH = os.path.join(DATA_DIR, "vault_history.json")
 RENDER_URL = os.getenv("MKV_RENDER_URL", "https://pro-movieapidrive.onrender.com")
 BLOCK = 25000
@@ -175,6 +176,16 @@ def _fleet_from_log(lines: list[str]) -> dict:
         if len(out) >= 3:
             break
     return out
+
+
+def _site_state() -> dict:
+    """Newest id seen on the site (recorded by the pusher's recent watcher)."""
+    try:
+        d = json.load(open(SITE_STATE, encoding="utf-8"))
+        return {"site_max_id": int(d.get("site_max_id") or 0),
+                "seen_at": float(d.get("seen_at") or 0)}
+    except Exception:
+        return {}
 
 
 def _idgap_state() -> dict:
@@ -339,6 +350,7 @@ def _sample_once() -> None:
         "uptime_min": int((time.time() - _started) / 60),
         "vault": _vault(col),
         "fleet": _fleet_from_log(lines),
+        "site": _site_state(),
         "idgap": _idgap_state(),
         "newest": _newest(col),
         "log": lines,
@@ -702,8 +714,14 @@ function render(d){
   if(prevRows!=null&&v.rows>prevRows){const el=$('rowsdelta');
    el.textContent='+'+fmt(v.rows-prevRows);el.classList.remove('pop');void el.offsetWidth;el.classList.add('pop');}
   prevRows=v.rows;
-  $('rowchips').innerHTML=`<span class="chip">newest id <b>${fmt(v.max_id)}</b></span>`+
-   `<span class="chip">not yet mined <b class="a">${fmt((v.max_id||0)-v.rows)}</b></span>`;}
+  const st=d.site||{};const smax=st.site_max_id||v.max_id;
+  const lag=Math.max(0,smax-v.max_id);
+  const lagCls=lag>60?'r':lag>15?'a':'g';
+  const polled=st.seen_at?Math.round(Date.now()/1000-st.seen_at):null;
+  $('rowchips').innerHTML=`<span class="chip" title="newest id in the vault">vault id <b>${fmt(v.max_id)}</b></span>`+
+   `<span class="chip" title="newest id seen on mkvbase.site${polled!=null?` (polled ${polled}s ago)`:''}">site id <b>${fmt(st.site_max_id||null)}</b></span>`+
+   `<span class="chip" title="uploads on the site the vault has not caught yet">lag <b class="${lagCls}">${fmt(lag)}</b></span>`+
+   `<span class="chip">not yet mined <b class="a">${fmt(smax-v.rows)}</b></span>`;}
  else $('rowchips').innerHTML=`<span class="chip r">${v.error||''}</span>`;
  if(v.coverage_pct!=null){const p=v.coverage_pct;
   $('gring').style.strokeDasharray=`${(p/100*301.59).toFixed(1)} 302`;
