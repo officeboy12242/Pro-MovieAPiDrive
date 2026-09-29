@@ -769,11 +769,26 @@ def index():
     return _HTML
 
 
+def _lan_ip() -> str:
+    """Primary LAN IPv4 so the log can print a phone-reachable URL."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def main() -> None:
     import uvicorn
+    host = os.getenv("MKV_DASHBOARD_HOST", "0.0.0.0")  # LAN-reachable for mobile
     _start_sampler()
-    print(f"[dashboard] http://127.0.0.1:{PORT}  (log: {LOG_PATH})", flush=True)
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
+    print(f"[dashboard] local : http://127.0.0.1:{PORT}", flush=True)
+    print(f"[dashboard] mobile: http://{_lan_ip()}:{PORT}   (same Wi-Fi)", flush=True)
+    uvicorn.run(app, host=host, port=PORT, log_level="warning")
 
 
 if __name__ == "__main__":
