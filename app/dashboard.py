@@ -20,7 +20,7 @@ import threading
 import time
 from collections import deque
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 DATA_DIR = os.getenv("MKV_DATA_DIR", "data")
@@ -529,6 +529,27 @@ header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:11px
 .pill.warn{border-color:rgba(251,191,36,.4);color:var(--amb)}
 .pill.dead{border-color:rgba(248,113,113,.45);color:var(--red)}
 #hdr-right{margin-left:auto;display:flex;gap:10px;color:var(--dim);font-size:12px;align-items:center}
+.sform{display:flex;gap:6px;align-items:center;margin-left:6px;min-width:0;flex:1;max-width:420px}
+.sform input{flex:1;min-width:120px;background:rgba(11,16,26,.75);border:1px solid var(--line);
+ border-radius:9px;color:var(--txt);font:12.5px 'Segoe UI',system-ui,sans-serif;
+ padding:7px 12px;outline:none;transition:border-color .2s}
+.sform input:focus{border-color:rgba(96,165,250,.55)}
+.sform input::placeholder{color:var(--faint)}
+.sform button{flex:none;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;
+ border:none;border-radius:9px;font-size:11.5px;font-weight:700;padding:7px 13px;cursor:pointer;
+ letter-spacing:.3px;transition:opacity .2s,transform .1s}
+.sform button:hover{opacity:.9}.sform button:active{transform:scale(.97)}
+.sform button:disabled{opacity:.5;cursor:wait}
+.spop{position:fixed;top:60px;right:20px;z-index:50;width:min(400px,92vw);
+ background:var(--panel2);border:1px solid var(--line2);border-radius:12px;padding:12px 14px;
+ box-shadow:0 12px 40px rgba(0,0,0,.5);display:none;font-size:12.5px}
+.spop.show{display:block;animation:evin .25s ease}
+.spop .t{font-weight:700;margin-bottom:6px;display:flex;justify-content:space-between;gap:8px}
+.spop .x{cursor:pointer;color:var(--dim);font-weight:400}
+.spop .x:hover{color:var(--txt)}
+.spop .r{color:var(--dim);padding:3px 0;border-bottom:1px solid rgba(154,172,207,.06)}
+.spop .r b{color:var(--blu);font-family:var(--mono);font-size:11.5px}
+.spop .ok{color:var(--grn)}.spop .err{color:var(--red)}
 .badge{display:flex;gap:6px;align-items:center;font-size:11.5px;padding:3px 10px;
  border-radius:8px;border:1px solid var(--line);background:rgba(11,16,26,.6)}
 main{max-width:1240px;margin:0 auto;padding:18px 20px 30px}
@@ -641,11 +662,16 @@ footer a{color:var(--blu);text-decoration:none}
  <div class="logo">P</div>
  <span class="brand">PRONOOB DRIVE <small>control room</small></span>
  <span class="pill" id="pill">connecting</span>
+ <form class="sform" id="sform" autocomplete="off">
+  <input id="sterm" type="text" maxlength="100" placeholder="Search + vault any title… (Enter)">
+  <button id="sbtn" type="submit" title="Crawl now, vault it, push to Render">vault it</button>
+ </form>
  <div id="hdr-right">
   <span class="badge" id="clockbadge" title="PC clock vs mkvbase server time — drift kills signed search URLs">clock <span class="num" id="clockv">—</span></span>
   <span class="badge num" id="pageup"></span>
  </div>
 </header>
+<div class="spop" id="spop"></div>
 <main>
  <div class="grid">
   <div class="card"><h3>Vault rows <span class="tag">mongo atlas</span></h3>
@@ -891,12 +917,97 @@ function render(d){
   `render serve: <b class="r">unreachable</b>`;}
  const lg=(d.log||[]).map(l=>`<div class="${cls(l)}">${l.replace(/</g,'&lt;')}</div>`).join('');
  if(lg!==prevLog){$('log').innerHTML=lg;prevLog=lg;$('log').scrollTop=$('log').scrollHeight;}}
+/* manual search: crawl + vault + push */
+$('sform').addEventListener('submit',async ev=>{ev.preventDefault();
+ const term=$('sterm').value.trim();if(!term)return;
+ const btn=$('sbtn');btn.disabled=true;btn.textContent='crawling…';
+ const pop=$('spop');pop.classList.add('show');
+ pop.innerHTML=`<div class="t">vaulting '${term.replace(/</g,'&lt;')}' <span class="x" onclick="document.getElementById('spop').classList.remove('show')">✕</span></div><div class="r">crawling mkvbase with the shared session…</div>`;
+ try{const r=await fetch('/api/search?term='+encodeURIComponent(term),{method:'POST'});
+  const d=await r.json();
+  if(d.ok){pop.innerHTML=`<div class="t">'${term.replace(/</g,'&lt;')}' <span class="x" onclick="document.getElementById('spop').classList.remove('show')">✕</span></div>`+
+   `<div class="r ok"><b>${d.rows}</b> rows · <b class="ok">+${d.new} new</b>, ${d.updated} updated · ${d.push}</div>`+
+   (d.top||[]).map(x=>`<div class="r"><b>${x.id??''}</b> ${(x.title||'').replace(/</g,'&lt;')}</div>`).join('');
+   $('sterm').value='';}
+  else{pop.innerHTML=`<div class="t">failed <span class="x" onclick="document.getElementById('spop').classList.remove('show')">✕</span></div>`+
+   `<div class="r err">${(d.err||d.err_||'error').replace(/</g,'&lt;')}</div>`;}}
+ catch(e){pop.innerHTML=`<div class="t">failed</div><div class="r err">${String(e).replace(/</g,'&lt;')}</div>`;}
+ btn.disabled=false;btn.textContent='vault it';});
+document.addEventListener('click',e=>{const p=$('spop');
+ if(p.classList.contains('show')&&!p.contains(e.target)&&!$('sform').contains(e.target))
+  p.classList.remove('show');});
 const es=new EventSource('/api/stream');
 es.onmessage=e=>{try{render(JSON.parse(e.data))}catch(_){}};
 es.onopen=()=>{$('pill').textContent='live';$('pill').className='pill'};
 es.onerror=()=>{$('pill').textContent='reconnecting…';$('pill').className='pill warn';
  const de=document.querySelector('.dot');if(de)de.className='dot warn'};
 </script></body></html>"""
+
+
+def _sync_key() -> str:
+    try:
+        return open(os.path.join(DATA_DIR, "sync_key.txt"),
+                    encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
+def _push_render(term: str, rows: list[dict]) -> str:
+    import urllib.request
+    payload = {"kind": "search", "term": term, "count": len(rows), "results": rows}
+    req = urllib.request.Request(
+        f"{RENDER_URL}/sync", data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json",
+                 **({"X-Sync-Key": _sync_key()} if _sync_key() else {})})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        links = (json.loads(r.read() or b"{}").get("links") or {})
+    return f"Render new {links.get('new', '?')} total {links.get('total', '?')}"
+
+
+def _do_manual_search(term: str) -> dict:
+    """Same flow as _search.py: crawl the term with the shared Cloudflare
+    session, vault rows (shard-aware), push to Render. Runs in a thread."""
+    from app.client import MkvbaseClient, NeedsSession
+    from app.store import make_index
+    out: dict = {"term": term, "ts": time.time()}
+    try:
+        client = MkvbaseClient(None)  # browser-free: borrow the fleet's session
+        try:
+            obj = client.search_http(term)
+        except NeedsSession:
+            if not client.ensure_session(timeout_s=150):
+                raise NeedsSession("could not clear Cloudflare")
+            obj = client.search_http(term)
+        rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
+        index = make_index(DATA_DIR)
+        new, upd = index.upsert(rows, source="manual")
+        try:
+            push = _push_render(term, rows)
+        except Exception as e:
+            push = f"push failed ({type(e).__name__}: {str(e)[:60]})"
+        out.update(ok=True, rows=len(rows), new=new, updated=upd, push=push,
+                   top=[{"id": r.get("id"), "title": (r.get("title") or "")[:80]}
+                        for r in rows[:5]])
+        _events.append({"ts": time.time(), "kind": "push",
+                        "text": f"manual '{term}' +{new} new, {len(rows)} rows"})
+    except Exception as e:
+        out.update(ok=False, err=f"{type(e).__name__}: {str(e)[:140]}")
+    return out
+
+
+_search_lock = threading.Lock()
+
+
+@app.post("/api/search")
+async def api_search(term: str = Query(..., min_length=1, max_length=100)):
+    if not _search_lock.acquire(blocking=False):
+        return JSONResponse({"ok": False, "err": "a search is already running"},
+                            status_code=429)
+    try:
+        res = await asyncio.to_thread(_do_manual_search, term.strip())
+        return JSONResponse(res)
+    finally:
+        _search_lock.release()
 
 
 @app.get("/", response_class=HTMLResponse)
