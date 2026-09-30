@@ -44,9 +44,6 @@ if not defined MKV_ENGINE set MKV_ENGINE=camoufox
 if not defined MKV_HEADLESS set MKV_HEADLESS=true
 if not defined MKV_RENDER_URL set MKV_RENDER_URL=https://pro-movieapidrive.onrender.com
 if not defined MKV_PUSHER_TERMS set MKV_PUSHER_TERMS=godzilla,interstellar,predestination,oppenheimer
-REM idgap: 6 agents, 6s gap - it has slot priority and the best yield/search
-if not defined MKV_IDGAP_AGENTS set MKV_IDGAP_AGENTS=6
-if not defined MKV_IDGAP_GAP_S set MKV_IDGAP_GAP_S=6
 if exist data\sync_key.txt set /p MKV_SYNC_KEY=<data\sync_key.txt
 
 echo [%date% %time%] fleet wrapper starting >> data\pusher.log
