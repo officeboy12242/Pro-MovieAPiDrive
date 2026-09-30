@@ -27,7 +27,7 @@ import os
 import random
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import date, timedelta
 
 from .client import MkvbaseClient
@@ -110,6 +110,9 @@ class IdGapMiner:
         self._series_cache: list[tuple[str, int]] | None = None
         self._fresh_cache: list[tuple[str, int]] | None = None
         self._fresh_ts = 0.0
+        # cap-spill reaction: a 50-row (capped) result proves the head is hot;
+        # its other facet/episode slices get queued ahead of normal rotation.
+        self._spill_queue: deque = deque(maxlen=80)
 
     # ------------------------------------------------------------ state
     def _load(self) -> None:
@@ -319,6 +322,19 @@ class IdGapMiner:
         now = time.time()
         m = _re.match(r"a(\d+)", agent)
         off = int(m.group(1)) if m else 0
+        # CAP-SPILL REACTION first: slices queued when a search hit the
+        # 50-row site cap — the head is proven hot, so its other dimensions
+        # are the highest-yield searches the fleet can make.
+        for _ in range(4):
+            with self._lock:
+                if not self._spill_queue:
+                    break
+                term = self._spill_queue.popleft()
+                if now - self.searched_terms.get(term, 0.0) <= self.term_ttl_s:
+                    continue
+                self.searched_terms[term] = now
+                self.stats["picked_block"] = self.stats.get("picked_block")
+                return None, "", [f"seed:{term}"]
         # FRESH-HEAD SWEEP first: heads of the newest vault pushes (20-min
         # cache). Bare head catches uploads since the vault push; head+top-
         # facet catches that head's pre-push siblings ranked below the cap.
@@ -385,7 +401,14 @@ class IdGapMiner:
                 best = (freshest, blk, era, heads[(off + int(now)) % len(heads)])
         if best is not None:
             _, blk, era, head = best
+            # Claim LRU re-picks: previously unclaimed, two agents could fire
+            # the identical bare head at once (seen live: 'sayonee' x2). A
+            # 10-min claim window spreads agents across heads; when every
+            # head of the stale block is claimed, agents idle one cycle.
             with self._lock:
+                if now - self.searched_terms.get(head, 0.0) <= 600:
+                    return None, "", []  # another agent just took this head
+                self.searched_terms[head] = now
                 self.stats["picked_block"] = blk * self.block
                 self.stats["picked_era"] = era
             return blk, era, [f"seed:{head}"]
@@ -433,6 +456,16 @@ class IdGapMiner:
             self.stats["terms_done"] += 1
             self.stats["rows_new"] += new
         self.searched_terms[term] = time.time()
+        # cap-spill reaction: a capped (50-row) result proves the head is
+        # hot. Queue its top facet slices ahead of normal rotation (bounded
+        # deque; TTL-dedup happens at pop time).
+        if len(rows) >= 50:
+            head = term.rsplit(" ", 1)[0] if " " in term else term
+            with self._lock:
+                for f in _SPILL_QUALS[:6] + ("zip", "s01"):
+                    t2 = f"{head} {f}"
+                    if t2 != term and t2 not in self._spill_queue:
+                        self._spill_queue.append(t2)
         self._seed_cache.pop(blk, None)  # refresh seeds after block work
         # a block is DONE only when it is actually full (fill_pct >= target);
         # term exhaustion never retires a block any more.
