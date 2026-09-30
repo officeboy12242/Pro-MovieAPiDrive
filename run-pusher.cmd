@@ -28,12 +28,13 @@ if exist data\mongo_uri.txt set /p MKV_MONGODB_URI=<data\mongo_uri.txt
 set MKV_DATA_DIR=data
 set PYTHONIOENCODING=utf-8
 set PYTHONUTF8=1
-REM Discovery keeps only priority(trending) + day + year lanes; the rest of
-REM the fleet is idgap (seed-heads mine alpha/words/facet content faster)
+REM Discovery keeps ONLY priority(trending) + day + year agents; the rest of
+REM the fleet is idgap (seed-heads mine alpha/words/facet/series faster)
 if not defined MKV_DISCOVERY_AGENTS set MKV_DISCOVERY_AGENTS=3
-REM idgap: 12 agents, 4s gap - the bulk of the fleet, slot priority 1
-if not defined MKV_IDGAP_AGENTS set MKV_IDGAP_AGENTS=12
-if not defined MKV_IDGAP_GAP_S set MKV_IDGAP_GAP_S=4
+REM idgap: 8 agents, 5s gap - biggest share of the 2 HTTP slots + best
+REM new-rows-per-search; Mongo pushes are unthrottled bulk upserts
+if not defined MKV_IDGAP_AGENTS set MKV_IDGAP_AGENTS=8
+if not defined MKV_IDGAP_GAP_S set MKV_IDGAP_GAP_S=5
 if not defined MKV_DISCOVERY_GAP_S set MKV_DISCOVERY_GAP_S=15
 if not defined MKV_DISCOVERY_VAULT_PULL set MKV_DISCOVERY_VAULT_PULL=5000
 REM Cap concurrent mkvbase GETs - agents used to stampede and kill cf_clearance
@@ -44,6 +45,7 @@ if not defined MKV_ENGINE set MKV_ENGINE=camoufox
 if not defined MKV_HEADLESS set MKV_HEADLESS=true
 if not defined MKV_RENDER_URL set MKV_RENDER_URL=https://pro-movieapidrive.onrender.com
 if not defined MKV_PUSHER_TERMS set MKV_PUSHER_TERMS=godzilla,interstellar,predestination,oppenheimer
+
 if exist data\sync_key.txt set /p MKV_SYNC_KEY=<data\sync_key.txt
 
 echo [%date% %time%] fleet wrapper starting >> data\pusher.log

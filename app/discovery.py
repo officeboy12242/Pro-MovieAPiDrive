@@ -1058,22 +1058,15 @@ class Discovery:
         # day-walk seeds first day then _boost_hot (pins lanterns etc. after pull)
         threading.Thread(target=self._day_loop, args=(log,), daemon=True,
                          name="disc-daywalk").start()
-        # Lane plan: priority(trending/hot) + day + year agents stay discovery;
-        # everything else (alpha/words/facet/series bulk) is folded into idgap,
-        # whose seed-head searches already pull that content faster per request.
-        prefer_cycle = (
-            "priority", "year", "day", "priority",
-            "alpha", "words", "facet", "facet", "words", "priority",
-        )
+        # Lane plan: discovery keeps ONLY trending/priority + day + year agents;
+        # everything else (alpha/words/facet/series bulk) is mined by idgap's
+        # seed-head searches (~6 new rows/search vs ~0.5 for probes).
+        prefer_cycle = ("priority", "year", "day")
         for i in range(n):
             prefer = prefer_cycle[i % len(prefer_cycle)]
             threading.Thread(target=self._agent_loop, args=(i, prefer, log),
                              daemon=True, name=f"disc-a{i}-{prefer}").start()
             time.sleep(min(1.2, self.gap_s / max(n, 1)))
-        # dedicated series/zip sweep agent only when the fleet is big enough
-        if n >= 4:
-            threading.Thread(target=self._agent_loop, args=(n, "series", log),
-                             daemon=True, name=f"disc-a{n}-series").start()
         while True:
             time.sleep(60)
             ad = " ".join(f"{k}={v}" for k, v in sorted(self.agent_done.items()))

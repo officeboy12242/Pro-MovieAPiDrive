@@ -38,6 +38,21 @@ _OTTS = ("zee5", "amzn", "nf", "hotstar", "sonyliv", "hoichoi", "aha",
 _QUALS = ("1080p", "720p", "480p", "2160p", "10bit", "hevc")
 _LANGS = ("hindi", "tamil", "telugu", "malayalam", "kannada", "english", "multi")
 _ALPHA = "abcdefghijklmnopqrstuvwxyz"
+# Facet-spill: a bare title-head search returns the site's NEWEST 50 matches
+# (already vaulted) — appending a quality/format facet reaches the SAME
+# title's OLDER/different-dimension rows ranked below the cap.
+# ORDER = measured yield (new rows per search; tools/idgap_stats.py leaderboard),
+# best first, so each agent's rotation front-loads the earners.
+# web-dl / dvdscr REMOVED: 290+ tries each, 0 rows ever returned by the site.
+_SPILL_QUALS = ("esub", "720p", "480p", "aac", "10bit", "2160p",
+                "1080p", "bluray", "hevc hd", "hevc", "webrip", "hdrip",
+                "bdrip")
+_SPILL_EXTRAS = ("zip", "s01", "e01", "hindi", "mkv", "dual audio",
+                 "tamil", "complete", "pack", "telugu")
+# Episode fanout: every other season/episode of a vaulted series is an
+# UNSEARCHED sub-50 slice — the season axis, like facets on the quality axis.
+_EP_SUFFIXES = tuple([f"s{n:02d}" for n in range(1, 8)]
+                     + [f"e{n:02d}" for n in range(1, 13)])
 import re as _re
 
 _HEAD_WORD = _re.compile(r"[a-z0-9]+")
@@ -92,6 +107,9 @@ class IdGapMiner:
         self._load()
         self._lock = threading.Lock()
         self._seed_cache: dict[int, list[str]] = {}  # block -> unsearched heads
+        self._series_cache: list[tuple[str, int]] | None = None
+        self._fresh_cache: list[tuple[str, int]] | None = None
+        self._fresh_ts = 0.0
 
     # ------------------------------------------------------------ state
     def _load(self) -> None:
@@ -187,7 +205,8 @@ class IdGapMiner:
         return ""
 
     # ------------------------------------------------------------ seeds
-    def _seeds_for_block(self, blk: int, n: int = 6) -> list[str]:
+    def _seeds_for_block(self, blk: int, n: int = 6,
+                         fresh_only: bool = True) -> list[str]:
         """Title-heads of rows we already hold in the thin block. Searching an
         exact head pulls that title's SIBLING uploads (other episodes/qualities
         uploaded around the same time) — the highest-yield way to fill a block,
@@ -207,10 +226,51 @@ class IdGapMiner:
             seen: set[str] = set()
             heads = [h for h in heads if not (h in seen or seen.add(h))]
             self._seed_cache[blk] = heads
-        # ALL heads (not only unsearched ones): the caller applies the TTL/claim
-        # gate and the LRU valve. Filtering here made every block look empty
-        # once all its seeds had been tried, idling the miner for hours.
-        return heads[:800]
+        if not fresh_only:
+            return heads[:800]
+        fresh = [h for h in heads if h not in self.searched_terms]
+        return fresh[:24]
+
+    def _series_heads(self) -> list[tuple[str, int]]:
+        """(head, block) of vaulted rows whose raw title carries a season mark
+        (S01E01 / season 2) — episode fanout mines their OTHER seasons, which
+        were never searched by the facet rotation."""
+        if self._series_cache is not None:
+            return self._series_cache
+        col = self._col()
+        if col is None:
+            return []
+        heads: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for r in col.find({"title": {"$type": "string"}}, {"title": 1}) \
+                .sort("id", -1).limit(4000):
+            title = r.get("title") or ""
+            h = _title_head(title)
+            if h and len(h) >= 3 and h not in seen and _SERIES_MARK.search(title):
+                seen.add(h)
+                heads.append((h, (r.get("id") or 0) // self.block))
+        self._series_cache = heads
+        return heads
+
+    def _fresh_heads(self) -> list[tuple[str, int]]:
+        """(head, block) of the NEWEST vault pushes (20-min cache). Their
+        sibling uploads from the same window are the most likely unvaulted
+        rows any head search can still catch."""
+        now = time.time()
+        if self._fresh_cache is not None and now - self._fresh_ts < 1200:
+            return self._fresh_cache
+        col = self._col()
+        if col is None:
+            return []
+        heads: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for r in col.find({}, {"title": 1}).sort("id", -1).limit(250):
+            h = _title_head(r.get("title") or "")
+            if h and len(h) >= 3 and h not in seen:
+                seen.add(h)
+                heads.append((h, (r.get("id") or 0) // self.block))
+        self._fresh_cache, self._fresh_ts = heads, now
+        return heads
 
     # ------------------------------------------------------------ term plan
     def _term_kind(self, term: str) -> str:
@@ -257,50 +317,79 @@ class IdGapMiner:
         if not cov or not cov["thin_blocks"]:
             return None, "", []
         now = time.time()
-        # Walk the 5 thinnest blocks and CLAIM the first unclaimed fresh seed.
-        # Claims are atomically stamped into searched_terms (TTL now+90s grace
-        # so a failed search retries quickly), so two agents can never pick the
-        # same term no matter how many agents run.
-        claim_s = float(os.getenv("MKV_IDGAP_CLAIM_S", "90"))
-        min_gap = float(os.getenv("MKV_IDGAP_SEED_MIN_GAP_S", "1200"))  # 20 min
-        best: tuple | None = None  # (stalest_seed_ts, blk, era, seeds)
+        m = _re.match(r"a(\d+)", agent)
+        off = int(m.group(1)) if m else 0
+        # FRESH-HEAD SWEEP first: heads of the newest vault pushes (20-min
+        # cache). Bare head catches uploads since the vault push; head+top-
+        # facet catches that head's pre-push siblings ranked below the cap.
+        fh = self._fresh_heads()
+        if fh:
+            head, fblk = fh[(off + int(now) // 90) % len(fh)]
+            sfx = ("", "esub", "720p", "480p")[(off + int(now) // 90) % 4]
+            term = f"{head} {sfx}".strip()
+            with self._lock:
+                if now - self.searched_terms.get(term, 0.0) > self.term_ttl_s:
+                    self.searched_terms[term] = now
+                    self.stats["picked_block"] = fblk * self.block
+                    self.stats["picked_era"] = ""
+                    return fblk, "", [f"seed:{term}"]
+        # EPISODE FANOUT: vaulted series heads x season/episode suffixes —
+        # every OTHER season of a show is an unsearched sub-50 slice.
+        series = self._series_heads()
+        if series:
+            rot = series[off % len(series):] + series[:off % len(series)]
+            with self._lock:
+                for i, (show, sblk) in enumerate(rot[:200]):
+                    term = f"{show} {_EP_SUFFIXES[(off + i) % len(_EP_SUFFIXES)]}"
+                    if now - self.searched_terms.get(term, 0.0) <= self.term_ttl_s:
+                        continue
+                    self.searched_terms[term] = now
+                    self.stats["picked_block"] = sblk * self.block
+                    self.stats["picked_era"] = ""
+                    return sblk, "", [f"seed:{term}"]
+        # Head x facet slices are the PRIMARY term space. A bare title-head
+        # search returns only the site's NEWEST 50 matches for that title
+        # (already vaulted -> 0 new forever), while head+facet slices reach
+        # the SAME title's older rows ranked below the cap — the only lever
+        # that actually fills a thin block. Universe: ~800 heads x 23 facets.
+        facets = _SPILL_QUALS + _SPILL_EXTRAS
         for blk_info in cov["thin_blocks"][:5]:
             blk = blk_info["block"]
             era = blk_info.get("era_date") or ""
-            seeds = self._seeds_for_block(blk)
+            heads = self._seeds_for_block(blk, fresh_only=False)
+            if not heads:
+                continue
+            rot = heads[off % len(heads):] + heads[:off % len(heads)]
             with self._lock:
-                fresh = [s for s in seeds
-                         if now - self.searched_terms.get(s, 0) > self.term_ttl_s
-                         and now - self.searched_terms.get(s, 0) > claim_s]
-                if fresh:
-                    pick = fresh[0]
-                    self.searched_terms[pick] = now + claim_s  # claim: free in 90s if it fails
-                else:
-                    pick = None
-            if pick:
-                with self._lock:
-                    self.stats["picked_block"] = blk_info["block_start"]
-                    self.stats["picked_era"] = era
-                return blk, era, [f"seed:{pick}"]
-            # remember the block whose most-recently-searched seed is OLDEST
-            lru = min((self.searched_terms.get(s, 0) for s in seeds), default=0)
-            if best is None or lru < best[0]:
-                best = (lru, blk, era, seeds)
-        # nothing fully fresh: CLAIM the globally stalest seed (>= min_gap old)
-        if best and best[3] and now - best[0] >= min_gap:
-            _, blk, era, seeds = best
-            with self._lock:
-                seeds = sorted(seeds, key=lambda s: self.searched_terms.get(s, 0))
-                pick = next((s for s in seeds
-                             if now - self.searched_terms.get(s, 0) > min_gap), None)
-                if pick:
-                    self.searched_terms[pick] = now + claim_s
-            if pick:
-                with self._lock:
+                for i, head in enumerate(rot):
+                    term = f"{head} {facets[(off + i) % len(facets)]}"
+                    if now - self.searched_terms.get(term, 0.0) <= self.term_ttl_s:
+                        continue  # searched or claimed recently
+                    self.searched_terms[term] = now  # atomic claim: no stampede
                     self.stats["picked_block"] = blk * self.block
                     self.stats["picked_era"] = era
-                return blk, era, [f"seed:{pick}"]
-        # last resort: era terms for the thinnest block
+                    return blk, era, [f"seed:{term}"]
+        # LRU valve: every slice in the 5 thinnest blocks is burned. Re-search
+        # the block whose freshest head is the OLDEST (most stale block), one
+        # bare head per call — new sibling uploads since the last try are the
+        # only rows a bare head can still catch.
+        best: tuple | None = None  # (block_freshness_ts, blk, era, head)
+        for blk_info in cov["thin_blocks"][:5]:
+            blk = blk_info["block"]
+            era = blk_info.get("era_date") or ""
+            heads = self._seeds_for_block(blk, fresh_only=False)
+            if not heads:
+                continue
+            freshest = max(self.searched_terms.get(h, 0.0) for h in heads)
+            if best is None or freshest < best[0]:
+                best = (freshest, blk, era, heads[(off + int(now)) % len(heads)])
+        if best is not None:
+            _, blk, era, head = best
+            with self._lock:
+                self.stats["picked_block"] = blk * self.block
+                self.stats["picked_era"] = era
+            return blk, era, [f"seed:{head}"]
+        # fall back to era terms for the thinnest block (no seeds at all)
         blk_info = cov["thin_blocks"][0]
         blk, era = blk_info["block"], blk_info.get("era_date") or ""
         pool = self._terms_for_era(era)
@@ -320,7 +409,9 @@ class IdGapMiner:
             return {"status": "idle", "agent": agent}
         raw = terms[0]
         term = raw[5:] if raw.startswith("seed:") else raw
-        kind = self._term_kind(term)
+        kind = ("seed-spill" if term.endswith(_SPILL_QUALS + _SPILL_EXTRAS)
+                else ("seed-ep" if term.endswith(_EP_SUFFIXES)
+                      else self._term_kind(term)))
         t0 = time.time()
         try:
             obj = self.client.search(term)
@@ -330,8 +421,6 @@ class IdGapMiner:
             return {"status": "retry", "term": term, "agent": agent,
                     "err": f"{type(e).__name__}: {str(e)[:100]}"}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
-        # search succeeded: upgrade the 90s claim to the full TTL stamp
-        self.searched_terms[term] = time.time()
         new, _upd = self.index.upsert(rows, source=f"idgap:{agent}:b{blk}")
         in_block = sum(1 for r in rows
                        if blk is not None and blk * self.block <= (r.get("id") or 0)
@@ -343,6 +432,7 @@ class IdGapMiner:
         with self._lock:
             self.stats["terms_done"] += 1
             self.stats["rows_new"] += new
+        self.searched_terms[term] = time.time()
         self._seed_cache.pop(blk, None)  # refresh seeds after block work
         # a block is DONE only when it is actually full (fill_pct >= target);
         # term exhaustion never retires a block any more.
@@ -415,6 +505,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
     from .client import MkvbaseClient
     from .engines import make_engine
+
     cli = MkvbaseClient(make_engine(), cache_path=os.path.join(args.data_dir, "pusher"))
     m = start_idgap(cli, args.data_dir)
     if m:
