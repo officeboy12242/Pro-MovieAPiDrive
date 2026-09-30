@@ -18,7 +18,7 @@ import os
 import re
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -167,12 +167,67 @@ def _log_tail_bytes() -> tuple[list[str], float]:
 
 
 _ALIVE = re.compile(r"up (\d+)m(\d+)s \| session=(\w+)")
+_SB_OK = re.compile(r"\[idgap:(a\d+)\] ok '([^']*)'/(\S+) block=(\d+) era=([\d-]*)?: "
+                    r"(\d+) rows, (\d+) new, \d+ in-block \([\d.]+s\)\s+cov=([\d.]+)%")
+_SB_RETRY = re.compile(r"\[idgap:(a\d+)\] RETRY")
+
+
+def _scoreboard(lines: list[str], block: int = 25_000) -> dict:
+    """Quiet scoreboard: mine the recent log window (~2h of lines) into the
+    numbers that matter — pace, yield, jackpots — no scrolling feed."""
+    import time as _t
+    now = _t.time()
+    hours = [0, 0, 0]          # [2h-1h, 1h-0h, live] new-rows buckets
+    searches = retries = capped = 0
+    cov = None
+    last_block = last_era = None
+    terms: Counter = Counter()
+    jack: dict[str, int] = {}
+    cur_age = 2.0  # heartbeat clock: [alive] up Xm -> line age = 2h - X
+    for l in lines[-2000:]:     # chronological; heartbeat age carried forward
+        hb = _ALIVE.search(l)
+        if hb:
+            cur_age = max(0.0, 2.0 - int(hb.group(1)) / 60)
+        if _SB_RETRY.search(l):
+            retries += 1
+            continue
+        m = _SB_OK.search(l)
+        if not m:
+            continue
+        searches += 1
+        _agent, term, kind, blk, _era, rows, new, c = m.groups()
+        new, rows = int(new), int(rows)
+        if rows >= 50:
+            capped += 1
+        if cur_age >= 1.0:
+            hours[0] += new
+        elif cur_age >= 0.05:
+            hours[1] += new
+        else:
+            hours[2] += new
+        terms[kind] += 1
+        if new > 0:
+            jack[term] = max(jack.get(term, 0), new)
+        cov, last_block, last_era = float(c), int(blk), _era
+    pace1 = hours[1] + hours[2]
+    yield1 = round(pace1 / max(searches, 1), 2)
+    top = sorted(jack.items(), key=lambda kv: -kv[1])[:5]
+    return {"h2": hours[0], "h1": pace1, "per_min": round(pace1 / 60.0, 1),
+            "searches": searches, "retries": retries,
+            "capped_pct": round(100.0 * capped / searches, 1) if searches else None,
+            "yield": yield1 if searches else None,
+            "cov": cov, "block": last_block,
+            "block_start": last_block * block if last_block is not None else None,
+            "era": last_era,
+            "top_kind": (terms.most_common(1) or [(None, 0)])[0][0],
+            "jackpots": [{"term": t, "new": n} for t, n in top]}
 _TICK = re.compile(r"done=(\d+) queued=(\d+).*?rows=(\d+).*?agents=(\d+)")
 _LANES = re.compile(r"\[priority=(\d+) day=(\d+) year=(\d+) alpha=(\d+) "
                     r"words=(\d+) series=(\d+) facet=(\d+)\]")
 
 
 _IDGAP_ON = re.compile(r"\[idgap\] online: agents=(\d+)")
+_IDGAP_AGENT = re.compile(r"\[idgap:(a\d+)\] (ok|RETRY)")
 _WANTED = ("uptime_min", "idgap_agents", "tick", "lanes")
 
 
@@ -204,6 +259,13 @@ def _fleet_from_log(lines: list[str]) -> dict:
                 out["lanes"] = {k: int(v) for k, v in zip(names, m.groups())}
         if all(k in out for k in _WANTED):
             break
+    # Live idgap-agent count beats the boot line: the boot-time '[idgap]
+    # online: agents=N' line ages out of the log window (or rotates away),
+    # while actual per-agent chatter in the recent window reflects reality.
+    # Fall back to the boot count when no chatter yet (fresh restart).
+    seen = {m.group(1) for l in lines[-500:]
+            if (m := _IDGAP_AGENT.search(l))}
+    out["idgap_agents"] = len(seen) if seen else out.get("idgap_agents", 0)
     return out
 
 
@@ -384,12 +446,13 @@ def _classify(l: str) -> tuple[str, str] | None:
 
 
 def _drain_events() -> None:
+    # Live event feed removed per user preference; log lines still feed the
+    # ok/fail health counters the header pill uses.
     for l in _consume_log_lines():
         ev = _classify(l)
         if ev:
-            kind, text = ev
+            kind, _text = ev
             now = time.time()
-            _events.append({"ts": now, "kind": kind, "text": text})
             if kind in ("ok", "idgap"):
                 _ok_t.append(now)
             elif kind == "fail":
@@ -428,6 +491,10 @@ def _sample_once() -> None:
     idx = _get_idx()
     col = idx._col if idx is not None else None
     lines, log_age = _log_tail_bytes()
+    try:
+        sb = _scoreboard(lines)
+    except Exception:
+        sb = None  # scoreboard must never take the whole payload down
     snap = {
         "ts": time.time(),
         "uptime_min": int((time.time() - _started) / 60),
@@ -438,7 +505,7 @@ def _sample_once() -> None:
         "newest": _newest(col),
         "log": lines,
         "log_age_s": round(log_age) if log_age >= 0 else -1,
-        "events": list(_events)[-30:],
+        "scoreboard": sb,
         "health": {"ok_min": _rate(_ok_t), "fail_min": _rate(_fail_t)},
         "clock": _skew_cache,
         "db": _latest.get("db") or {},
@@ -644,6 +711,15 @@ td.t{white-space:normal;max-width:0;width:100%;overflow:hidden;text-overflow:ell
 tr.new td{animation:rowin 2.2s ease-out}
 @keyframes rowin{0%{background:rgba(52,211,153,.14)}100%{background:transparent}}
 .feed{max-height:288px;overflow-y:auto;font-size:12.5px}
+.sbhero{display:flex;gap:30px;margin:6px 0 12px}
+.sbnum .v{font-size:31px;font-weight:750;line-height:1.1;background:linear-gradient(135deg,#eaeff8,#8fb2ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sblab{font-size:10px;letter-spacing:1.6px;color:var(--faint);text-transform:uppercase;margin-top:4px}
+.sbrow{display:flex;flex-wrap:wrap;gap:6px}
+.sblist{display:flex;flex-direction:column;gap:4px;font-size:12.5px}
+.sblist .jk{display:flex;align-items:baseline;gap:9px;padding:4px 9px;border-radius:8px;background:rgba(52,211,153,.06);border:1px solid rgba(52,211,153,.10)}
+.sblist .jk b{color:var(--grn);font-family:var(--mono);flex:none}
+.sblist .jk span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sblist .jk small{margin-left:auto;color:var(--faint);flex:none;font-size:10px;letter-spacing:1px;text-transform:uppercase}
 .ev{display:flex;gap:9px;padding:4px 8px;border-radius:7px;align-items:baseline;
  border-left:2px solid transparent}
 .ev .ts{color:var(--faint);font-size:10.5px;flex:none;width:52px;font-family:var(--mono)}
@@ -758,8 +834,20 @@ footer a{color:var(--blu);text-decoration:none}
    <div class="xlab"><span>24h ago</span><span>now</span></div></div></div>
 
  <div class="two">
-  <div class="card"><h3>Live events <span class="tag" id="evtag"></span></h3>
-   <div class="feed" id="feed"></div></div>
+  <div class="card"><h3>Mining scoreboard <span class="tag" id="sbtag">last 2h</span></h3>
+   <div class="sbhero">
+    <div class="sbnum"><div class="v num" id="sbh1">—</div><div class="sblab">rows · last hour</div></div>
+    <div class="sbnum"><div class="v num" id="sbprev">—</div><div class="sblab">rows · hour before</div></div>
+   </div>
+   <div class="sbrow">
+    <span class="chip" title="idgap searches in the window">searches <b id="sbsearches" class="num">—</b></span>
+    <span class="chip" title="new rows per search">yield <b id="sbyield" class="num g">—</b></span>
+    <span class="chip" title="searches that hit the 50-row site cap">capped <b id="sbcapped" class="num">—</b></span>
+    <span class="chip" title="engine retries">retries <b id="sbretries" class="num a">—</b></span>
+    <span class="chip" title="hardest-working lane">top lane <b id="sbkind" class="num">—</b></span>
+   </div>
+   <div class="sblab" style="margin:14px 0 6px">top jackpots</div>
+   <div id="sbjackpots" class="sblist"><span style="color:var(--faint)">—</span></div></div>
   <div class="card"><h3>Newest pushes → mongo</h3>
    <div style="max-height:288px;overflow-y:auto">
    <table><thead><tr><th>id</th><th>title</th><th>src</th></tr></thead>
@@ -831,13 +919,19 @@ function heatmap(blocks){if(!blocks)return;const ser=JSON.stringify(blocks);
  if(thin.length){ht.style.display='';
   ht.innerHTML='thinnest: '+thin.map(x=>`<b class="r">${x.b.block*25}k · ${x.p}%</b>`).join(' · ')}
  else ht.style.display='none';}
-function events(evs){if(!evs)return;
- const now=Date.now()/1000;
- $('feed').innerHTML=evs.slice().reverse().map(e=>{
-  const rel=now-e.ts,rs=rel<60?`${Math.round(rel)}s`:`${Math.floor(rel/60)}m`;
-  const tx=e.text.replace(/</g,'&lt;').replace(/'([^']*)' \+(\d+)/,"'<b>$1</b>' <b>+$2</b>");
-  return `<div class="ev ${e.kind}"><span class="ts">${rs}</span><span class="tx">${tx}</span></div>`}).join('');
- $('evtag').textContent=evs.length+' recent';}
+function scoreboard(sb){if(!sb)return;
+ $('sbh1').textContent=sb.h1!=null?fmt(sb.h1):'—';
+ $('sbprev').textContent=sb.h2!=null?fmt(sb.h2):'—';
+ $('sbsearches').textContent=fmt(sb.searches);
+ $('sbyield').textContent=sb.yield!=null?sb.yield:'—';
+ $('sbcapped').textContent=sb.capped_pct!=null?sb.capped_pct+'%':'—';
+ $('sbretries').textContent=fmt(sb.retries);
+ $('sbkind').textContent=sb.top_kind||'—';
+ $('sbtag').textContent='cov '+(sb.cov!=null?sb.cov+'%':'—')+' · blk '+(sb.block_start!=null?Math.round(sb.block_start/1000)+'k':'—');
+ const js=sb.jackpots||[];
+ $('sbjackpots').innerHTML=js.length?js.map(j=>
+  `<div class="jk"><b>+${fmt(j.new)}</b><span>${j.term.replace(/</g,'&lt;')}</span><small>${j.new>=40?'jackpot':j.new>=20?'big':'good'}</small></div>`).join('')
+  :'<span style="color:var(--faint)">no wins in window</span>';}
 function render(d){
  const ok=d.log_age_s!=null&&d.log_age_s>=0&&d.log_age_s<90;
  const dotEl=document.querySelector('.dot');
@@ -904,7 +998,7 @@ function render(d){
   $('clockv').style.color=a>120?'var(--red)':a>30?'var(--amb)':'var(--grn)';}
  heatmap(v.blocks);
  chart(d.history);
- events(d.events);
+ scoreboard(d.scoreboard);
  const f=d.fleet||{};
  if(f.tick){const tot=(f.tick.agents||0)+(f.idgap_agents||0);
   $('fleetv').innerHTML=`${tot} <span class="g">agents</span> <small style="font-size:14px;color:var(--dim)">(${f.tick.agents} discovery + ${f.idgap_agents||0} idgap)</small>`;
