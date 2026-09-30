@@ -173,10 +173,15 @@ _LANES = re.compile(r"\[priority=(\d+) day=(\d+) year=(\d+) alpha=(\d+) "
 
 
 _IDGAP_ON = re.compile(r"\[idgap\] online: agents=(\d+)")
+_WANTED = ("uptime_min", "idgap_agents", "tick", "lanes")
 
 
 def _fleet_from_log(lines: list[str]) -> dict:
     out: dict = {}
+    # newest-first scan; stop only when EVERY wanted key was seen. The old
+    # len(out) >= 3 break fired after {uptime_min, session, tick} and never
+    # reached the boot-time '[idgap] online: agents=N' line, so the fleet
+    # card permanently showed 0 idgap agents.
     for l in reversed(lines):
         if "uptime_min" not in out and "[alive]" in l:
             m = _ALIVE.search(l)
@@ -197,7 +202,7 @@ def _fleet_from_log(lines: list[str]) -> dict:
             if m:
                 names = ("priority", "day", "year", "alpha", "words", "series", "facet")
                 out["lanes"] = {k: int(v) for k, v in zip(names, m.groups())}
-        if len(out) >= 3:
+        if all(k in out for k in _WANTED):
             break
     return out
 
