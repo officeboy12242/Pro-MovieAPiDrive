@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PRONOOB DRIVE — control room</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/static/dashboard.css">
+
+<!-- Tailwind (vendored, JIT) supplies layout utilities only; every colour,
+     font and component style comes from dashboard.css, so no tailwind.config
+     is needed and the two scripts never have to agree on load order. -->
+<script defer src="/static/vendor/tailwind.js"></script>
+
+<script defer src="/static/dashboard.js"></script>
+<script defer src="/static/vendor/alpine.min.js"></script>
+</head>
+
+<body x-data="dash()" x-init="boot()" x-cloak>
+
+<header>
+  <span class="dot" :class="dotClass"></span>
+  <div class="logo">P</div>
+  <span class="brand">PRONOOB DRIVE <small>control room</small></span>
+  <span class="pill" :class="pillClass" x-text="pillText"></span>
+
+  <form class="sform" autocomplete="off" @submit.prevent="vaultIt()">
+    <input x-model="term" type="text" maxlength="100"
+           placeholder="Search + vault any title… (Enter)" :disabled="busy">
+    <button type="submit" :disabled="busy || !term.trim()" x-text="busy ? 'crawling…' : 'vault it'"
+            title="Crawl now, vault it, push to Render"></button>
+  </form>
+
+  <div id="hdr-right">
+    <span class="badge" :title="clockTitle">
+      clock <span class="num" :style="clockStyle" x-text="clockText"></span>
+    </span>
+    <span class="badge num" x-text="pageMeta"></span>
+  </div>
+</header>
+
+<!-- search result popup -->
+<div class="spop" x-show="pop" x-transition @click.outside="pop = null">
+  <div class="t">
+    <span x-text="popTitle"></span>
+    <span class="x" @click="pop = null">✕</span>
+  </div>
+  <template x-for="(ln, i) in popLines" :key="i">
+    <div class="r" :class="ln.cls" x-html="ln.html"></div>
+  </template>
+</div>
+
+<main class="max-w-[1320px] mx-auto px-5 pb-8 pt-[18px]">
+
+  <!-- ============================================================ KPI row -->
+  <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3.5 mb-3.5">
+
+    <div class="card">
+      <h3>Vault rows <span class="tag">mongo atlas</span></h3>
+      <div class="v num" x-ref="rows" id="rows">—</div>
+      <span class="delta num" id="rowsdelta"></span>
+      <div class="chips" x-html="rowChips"></div>
+    </div>
+
+    <div class="card">
+      <h3>Site coverage</h3>
+      <div class="gwrap">
+        <svg width="108" height="108" viewBox="0 0 120 120" aria-label="coverage">
+          <defs><linearGradient id="gg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
+          <circle cx="60" cy="60" r="48" fill="none" stroke="rgba(154,172,207,.12)" stroke-width="10"/>
+          <circle class="ring" cx="60" cy="60" r="48" fill="none" stroke="url(#gg)"
+                  stroke-width="10" stroke-linecap="round" stroke-dasharray="0 302"
+                  transform="rotate(-90 60 60)" :style="ringStyle"/>
+          <text class="gpct" x="60" y="58" text-anchor="middle" x-text="covPct"></text>
+          <text class="gsub" x="60" y="76" text-anchor="middle">of ids</text>
+        </svg>
+        <div style="min-width:0">
+          <div class="s" x-html="covSub"></div>
+          <div class="chips" x-html="covChips"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Push velocity</h3>
+      <div class="v num" id="rate">—<small> rows/min</small></div>
+      <div class="statrow"><span class="lab">last hour</span>
+        <span class="bar"><i style="background:var(--blu)" :style="barH1"></i></span>
+        <span class="val num" x-text="vh1"></span></div>
+      <div class="statrow"><span class="lab">24 hours</span>
+        <span class="bar"><i style="background:var(--pur)" :style="barH24"></i></span>
+        <span class="val num" x-text="vh24"></span></div>
+      <div class="s" x-text="rateSub"></div>
+    </div>
+
+    <div class="card">
+      <h3>Crawl health <span class="tag">per min · 5m window</span></h3>
+      <div class="v num" id="health">—<small> ok/min</small></div>
+      <div class="statrow"><span class="lab">success</span>
+        <span class="bar"><i style="background:var(--grn)" :style="barOk"></i></span>
+        <span class="val num" x-text="vok"></span></div>
+      <div class="statrow"><span class="lab">failure</span>
+        <span class="bar"><i style="background:var(--red)" :style="barFail"></i></span>
+        <span class="val num" x-text="vfail"></span></div>
+      <div class="s" x-html="healthSub"></div>
+    </div>
+  </div>
+
+  <!-- =================================================== mongo deep-dive -->
+  <div class="card mb-3.5">
+    <h3>MongoDB atlas storage <span class="tag" x-text="dbTag"></span></h3>
+    <div class="dbrow">
+      <div style="min-width:130px">
+        <div class="v num" id="dbused">—<small> MB used</small></div>
+        <div class="s" x-html="dbPct"></div>
+      </div>
+      <div class="dbbar" title="data · indexes · free">
+        <div id="dbdata" :style="dbDataW"></div>
+        <div id="dbidx" :style="dbIdxW"></div>
+        <div id="dbfree" :style="dbFreeW"></div>
+      </div>
+      <div class="chips" style="flex:2;min-width:300px;margin-top:0" x-html="dbChips"></div>
+    </div>
+
+    <!-- NEW: quota projection + doc economics -->
+    <div class="three mt-3.5" style="gap:14px">
+      <div>
+        <div class="sblab">quota headroom</div>
+        <div class="v num text-[22px]" x-text="dbFree"></div>
+        <div class="s" x-html="dbRunway"></div>
+      </div>
+      <div>
+        <div class="sblab">index overhead</div>
+        <div class="v num text-[22px]" x-text="dbIdxPct"></div>
+        <div class="s" x-html="dbIdxSub"></div>
+      </div>
+      <div>
+        <div class="sblab">avg document</div>
+        <div class="v num text-[22px]" x-text="dbAvg"></div>
+        <div class="s" x-html="dbAvgSub"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================================================== id-block heatmap -->
+  <div class="card mb-3.5">
+    <h3>
+      Id-block fill rate
+      <span class="tag num">each bar = 25,000 site ids · dashed = 60% target · click a bar to inspect</span>
+    </h3>
+    <div class="hmwrap">
+      <div class="hm" id="hm">
+        <div class="hline" style="bottom:25%"><span>25</span></div>
+        <div class="hline" style="bottom:50%"><span>50</span></div>
+        <div class="hline" style="bottom:75%"><span>75</span></div>
+        <div class="htarget" style="bottom:60%"><span>60</span></div>
+        <template x-for="b in blocks" :key="b.block">
+          <div class="hcol" :class="{ sel: selBlock === b.block }" :title="b.title"
+               @click="jumpBlock(b.block)">
+            <div class="hfill" :style="b.style"></div>
+          </div>
+        </template>
+      </div>
+      <div class="hlabels" id="hmlabels">
+        <template x-for="b in blocks" :key="b.block"><span x-text="b.lab"></span></template>
+      </div>
+    </div>
+    <div class="chips mt-2.5">
+      <span class="chip"><i class="inline-block w-2 h-2 rounded-sm align-middle mr-1.5" style="background:var(--red)"></i>&lt;15% full</span>
+      <span class="chip"><i class="inline-block w-2 h-2 rounded-sm align-middle mr-1.5" style="background:var(--amb)"></i>15–40%</span>
+      <span class="chip"><i class="inline-block w-2 h-2 rounded-sm align-middle mr-1.5" style="background:var(--cyn)"></i>40–60%</span>
+      <span class="chip"><i class="inline-block w-2 h-2 rounded-sm align-middle mr-1.5" style="background:var(--grn)"></i>≥60% done</span>
+      <span class="chip" x-show="thinChips" x-html="thinChips"></span>
+    </div>
+
+    <!-- NEW: click-to-inspect block detail (x-if, not x-show: blockInfo is null
+         until a bar is clicked and its children must not be evaluated then) -->
+    <template x-if="blockInfo">
+      <div class="inspect" x-transition>
+        <span class="x" @click="selBlock = null">✕</span>
+        <div>block <b x-text="blockInfo.no"></b></div>
+        <div>id range <b x-text="blockInfo.range"></b></div>
+        <div>rows <b x-text="blockInfo.have"></b></div>
+        <div>fill <b :style="blockInfo.style" x-text="blockInfo.pct"></b></div>
+        <div>missing <b class="a" x-text="blockInfo.missing"></b></div>
+        <div>verdict <b x-text="blockInfo.verdict"></b></div>
+      </div>
+    </template>
+  </div>
+
+  <!-- ================================================ vault growth chart -->
+  <div class="card mb-3.5">
+    <h3>
+      <span>Vault growth <span class="num" x-text="chartSum"></span></span>
+      <span class="seg">
+        <template x-for="r in ranges" :key="r.k">
+          <button :class="{ on: range === r.k }" @click="range = r.k" x-text="r.lab"></button>
+        </template>
+      </span>
+    </h3>
+    <div class="chartwrap" @mousemove="chartMove($event)" @mouseleave="tip = null">
+      <div class="ylab" style="top:6px" x-text="ylMax"></div>
+      <div class="ylab" style="top:50%" x-text="ylMid"></div>
+      <div class="ylab" style="bottom:22px" x-text="ylMin"></div>
+      <svg id="chart" viewBox="0 0 620 150" preserveAspectRatio="none" x-html="chartSvg"></svg>
+      <div class="xlab"><span x-text="xLeft"></span><span x-text="xRight"></span></div>
+      <div class="tip" x-show="tip" :style="tipStyle" x-text="tip"></div>
+    </div>
+  </div>
+
+  <!-- ================================================ mining deep-dive -->
+  <div class="three mb-3.5">
+
+    <div class="card">
+      <h3>Mining scoreboard <span class="tag" x-text="sbTag"></span></h3>
+      <div class="sbhero">
+        <div class="sbnum"><div class="v num" x-text="sbH1"></div><div class="sblab">rows · last hour</div></div>
+        <div class="sbnum"><div class="v num" x-text="sbH2"></div><div class="sblab">rows · hour before</div></div>
+      </div>
+      <div class="sbrow">
+        <span class="chip" title="idgap searches in the window">searches <b class="num" x-text="sbSearches"></b></span>
+        <span class="chip" title="new rows per search">yield <b class="num g" x-text="sbYield"></b></span>
+        <span class="chip" title="searches that hit the 50-row site cap">capped <b class="num" x-text="sbCapped"></b></span>
+        <span class="chip" title="engine retries">retries <b class="num a" x-text="sbRetries"></b></span>
+        <span class="chip" title="rows per minute across all agents">rate <b class="num" x-text="sbPerMin"></b></span>
+        <span class="chip" title="hardest-working lane">top lane <b class="num" x-text="sbKind"></b></span>
+      </div>
+      <div class="s mt-3" x-html="sbContext"></div>
+      <div class="sblab" style="margin:14px 0 6px">top jackpots</div>
+      <div class="sblist scroll">
+        <template x-for="(j, i) in jackpots" :key="i">
+          <div class="jk"><b x-text="'+' + fmt(j.new)"></b><span x-text="j.term"></span>
+            <small x-text="j.new >= 40 ? 'jackpot' : (j.new >= 20 ? 'big' : 'good')"></small></div>
+        </template>
+        <span class="faint" x-show="!jackpots.length">no wins in window</span>
+      </div>
+    </div>
+
+    <!-- NEW: per-lane dispatch table -->
+    <div class="card">
+      <h3>Lane dispatch <span class="tag" x-text="laneTag"></span></h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>lane</th><th class="num">dispatched</th><th class="num">share</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="l in lanes" :key="l.name">
+              <tr>
+                <td x-text="l.name"></td>
+                <td class="num" x-text="fmt(l.n)"></td>
+                <td class="num dim" x-text="l.pct + '%'"></td>
+                <td style="width:38%"><span class="bar2"><i :style="l.style"></i></span></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div class="s" x-html="laneSub"></div>
+    </div>
+
+    <!-- NEW: idgap term leaderboard -->
+    <div class="card">
+      <h3>IdGap terms <span class="tag" x-text="termTag"></span></h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>term</th><th class="num">tries</th><th class="num">new</th><th class="num">hit%</th></tr></thead>
+          <tbody>
+            <template x-for="t in terms" :key="t.name">
+              <tr>
+                <td class="t" x-text="t.name"></td>
+                <td class="num dim" x-text="fmt(t.tries)"></td>
+                <td class="num g" x-text="fmt(t.new)"></td>
+                <td class="num dim" x-text="t.hit"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div class="s" x-html="termSub"></div>
+    </div>
+  </div>
+
+  <!-- ================================================== feeds + crawler -->
+  <div class="two mb-3.5">
+    <div class="card">
+      <h3>Newest pushes → mongo</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>id</th><th>title</th><th>src</th></tr></thead>
+          <tbody>
+            <template x-for="x in newest" :key="x.id">
+              <tr :class="{ new: x.id > lastFeedId }">
+                <td class="num" x-text="x.id ?? ''"></td>
+                <td class="t" x-text="x.title"></td>
+                <td :class="x.src === 'idgap' ? 'p' : 'b'" x-text="x.src"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Crawler log</h3>
+      <div class="lg" id="log" x-ref="log"><div x-html="logHtml"></div></div>
+    </div>
+  </div>
+
+  <!-- ================================================ infra health row -->
+  <div class="three mb-3.5">
+
+    <div class="card">
+      <h3>Fleet <span class="tag" x-text="fleetTag"></span></h3>
+      <div class="v" x-html="fleetV"></div>
+      <div class="s" x-html="fleetSub"></div>
+      <div class="lanes" x-html="lanesHtml"></div>
+      <h3 class="mt-4">Push sources <span class="tag" x-text="srcLeg"></span></h3>
+      <div class="meter" id="srcbar" x-html="srcBar"></div>
+      <div class="s mt-2.5" x-html="renderSub"></div>
+    </div>
+
+    <!-- NEW: render serve panel -->
+    <div class="card">
+      <h3>Render serve <span class="tag" x-text="renderTag"></span></h3>
+      <div class="flex items-center gap-2 mb-2">
+        <span class="statdot" :class="renderDot"></span>
+        <span class="v text-[20px]" x-text="renderState"></span>
+      </div>
+      <table>
+        <tbody>
+          <tr><td class="dim">served rows</td><td class="num" x-text="fmt(render.rows)"></td></tr>
+          <tr><td class="dim">uptime</td><td class="num" x-text="render.uptime || '—'"></td></tr>
+          <tr><td class="dim">memory</td><td class="num" x-text="render.mem_mb != null ? render.mem_mb + ' MB' : '—'"></td></tr>
+          <tr><td class="dim">mode</td><td class="num" x-text="render.serve_only ? 'serve only' : 'serve + sync'"></td></tr>
+        </tbody>
+      </table>
+      <div class="s" x-html="renderNote"></div>
+    </div>
+
+    <!-- NEW: site crawler + clock panel -->
+    <div class="card">
+      <h3>Site crawler <span class="tag" x-text="siteTag"></span></h3>
+      <div class="v num text-[22px]" x-text="fmt(site.site_max_id)"></div>
+      <div class="s" x-html="siteSub"></div>
+      <table class="mt-2">
+        <tbody>
+          <tr><td class="dim">vault head</td><td class="num" x-text="fmt(vault.max_id)"></td></tr>
+          <tr><td class="dim">catch-up lag</td><td class="num" :class="lagCls" x-text="fmt(lag)"></td></tr>
+          <tr><td class="dim">poll age</td><td class="num" x-text="polledText"></td></tr>
+          <tr><td class="dim">clock skew</td><td class="num" :style="clockStyle" x-text="clockText"></td></tr>
+          <tr><td class="dim">last check</td><td class="num" x-text="clockChecked"></td></tr>
+        </tbody>
+      </table>
+      <div class="s" x-html="siteNote"></div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  PRONOOB DRIVE · vault streamed live over server-sent events · read-only ·
+  <a href="/api/live">/api/live</a> ·
+  fleet control: <code>C:\mkvdata\run-fleet.ps1 start|stop|status</code>
+</footer>
+
+</body>
+</html>
