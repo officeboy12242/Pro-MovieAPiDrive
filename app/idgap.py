@@ -82,6 +82,13 @@ def _title_head(title: str) -> str | None:
 class IdGapMiner:
     """Targets the thinnest id-blocks with era-appropriate search terms."""
 
+    # Class-level defaults so _next_terms() stays usable when the object is
+    # built without __init__ (the offline unit tests do exactly that).
+    # __init__ overrides these from the environment.
+    spill_every = 3
+    blocks_scan = 10
+    _pick = 0
+
     def __init__(self, client: MkvbaseClient, index, state_dir: str):
         self.client = client
         self.index = index
@@ -113,6 +120,15 @@ class IdGapMiner:
         # cap-spill reaction: a 50-row (capped) result proves the head is hot;
         # its other facet/episode slices get queued ahead of normal rotation.
         self._spill_queue: deque = deque(maxlen=80)
+        # Phase 1 ration: serve the cap-spill path only every Nth pick. Measured
+        # new rows per search: seed-head 0.50, seed-ep 0.25, seed-spill 0.10.
+        # Cap-spill ran first and unconditionally, so the fleet's term supply
+        # went to the weakest lane (4653 tries vs seed-head's 238) and the
+        # higher-yield lanes were only ever reached when spill ran dry.
+        self.spill_every = max(1, int(os.getenv("MKV_IDGAP_SPILL_EVERY", "3")))
+        # How many thin blocks one call may consider when picking a head.
+        self.blocks_scan = max(1, int(os.getenv("MKV_IDGAP_BLOCKS_SCAN", "10")))
+        self._pick = 0
 
     # ------------------------------------------------------------ state
     def _load(self) -> None:
@@ -322,19 +338,24 @@ class IdGapMiner:
         now = time.time()
         m = _re.match(r"a(\d+)", agent)
         off = int(m.group(1)) if m else 0
-        # CAP-SPILL REACTION first: slices queued when a search hit the
-        # 50-row site cap — the head is proven hot, so its other dimensions
-        # are the highest-yield searches the fleet can make.
-        for _ in range(4):
-            with self._lock:
-                if not self._spill_queue:
-                    break
-                term = self._spill_queue.popleft()
-                if now - self.searched_terms.get(term, 0.0) <= self.term_ttl_s:
-                    continue
-                self.searched_terms[term] = now
-                self.stats["picked_block"] = self.stats.get("picked_block")
-                return None, "", [f"seed:{term}"]
+        # Rotating gate so the fresh-head and episode-fanout lanes below are
+        # actually reached instead of losing every pick to cap-spill.
+        with self._lock:
+            self._pick += 1
+            allow_spill = (self._pick % self.spill_every == 0)
+        # CAP-SPILL REACTION: slices queued when a search hit the 50-row site
+        # cap. Rationed -- see self.spill_every.
+        if allow_spill:
+            for _ in range(4):
+                with self._lock:
+                    if not self._spill_queue:
+                        break
+                    term = self._spill_queue.popleft()
+                    if now - self.searched_terms.get(term, 0.0) <= self.term_ttl_s:
+                        continue
+                    self.searched_terms[term] = now
+                    self.stats["picked_block"] = self.stats.get("picked_block")
+                    return None, "", [f"seed:{term}"]
         # FRESH-HEAD SWEEP first: heads of the newest vault pushes (20-min
         # cache). Bare head catches uploads since the vault push; head+top-
         # facet catches that head's pre-push siblings ranked below the cap.
@@ -369,7 +390,7 @@ class IdGapMiner:
         # the SAME title's older rows ranked below the cap — the only lever
         # that actually fills a thin block. Universe: ~800 heads x 23 facets.
         facets = _SPILL_QUALS + _SPILL_EXTRAS
-        for blk_info in cov["thin_blocks"][:5]:
+        for blk_info in cov["thin_blocks"][:self.blocks_scan]:
             blk = blk_info["block"]
             era = blk_info.get("era_date") or ""
             heads = self._seeds_for_block(blk, fresh_only=False)
@@ -390,7 +411,7 @@ class IdGapMiner:
         # bare head per call — new sibling uploads since the last try are the
         # only rows a bare head can still catch.
         best: tuple | None = None  # (block_freshness_ts, blk, era, head)
-        for blk_info in cov["thin_blocks"][:5]:
+        for blk_info in cov["thin_blocks"][:self.blocks_scan]:
             blk = blk_info["block"]
             era = blk_info.get("era_date") or ""
             heads = self._seeds_for_block(blk, fresh_only=False)

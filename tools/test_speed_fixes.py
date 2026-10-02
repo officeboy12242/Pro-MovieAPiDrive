@@ -60,7 +60,7 @@ def test_lru_claim_no_duplicates() -> None:
     print("PASS  LRU valve: head claimed once, duplicate pick refused")
 
 
-def test_cap_spill_priority_and_populate() -> None:
+def test_cap_spill_is_rationed() -> None:
     m = make_miner()
     m.client = SimpleNamespace(search=lambda term: {
         "results": [{"id": 50_001 + i, "title": f"hot head part {i}"}
@@ -72,10 +72,25 @@ def test_cap_spill_priority_and_populate() -> None:
     assert "solo head 720p" not in m._spill_queue, "queued the searched slice"
     assert len(m._spill_queue) == 7, list(m._spill_queue)
     assert "solo head esub" in m._spill_queue and "solo head s01" in m._spill_queue
-    # 2) queued spill slices must beat facet rotation on the next pick
-    blk, era, terms = m._next_terms(3, "a2")
-    assert terms == ["seed:solo head esub"], terms
-    print("PASS  cap-spill: capped search queued 7 sibling facets; pops beat rotation")
+    # 2) Phase 1: cap-spill is the lowest-yield lane (0.10 new rows/search vs
+    #    seed-head 0.50), so it must be rationed to 1-in-N picks. If it still
+    #    wins every pick the fleet spends all its supply on the weakest lane.
+    assert m.spill_every >= 2, m.spill_every
+    # Only the cap-spill branch ever pops _spill_queue, so a shrinking queue
+    # after a pick is a direct read on whether the ration served that pick.
+    picks = served = 0
+    for _ in range(m.spill_every * 3):
+        before = len(m._spill_queue)
+        m._next_terms(3, "a2")
+        picks += 1
+        if len(m._spill_queue) < before:
+            served += 1
+        burn_facets(m)                            # facet slices all burned
+        m.searched_terms.pop("solo head esub", None)
+        m._spill_queue.append("solo head esub")   # keep the queue non-empty
+    assert served == 3, \
+        f"expected 3 of {picks} picks served spill, got {served}"
+    print("PASS  cap-spill: queued 7 sibling facets; rationed to 1-in-N picks")
 
 
 def test_facet_rotation_still_works() -> None:
@@ -88,7 +103,7 @@ def test_facet_rotation_still_works() -> None:
 
 if __name__ == "__main__":
     test_lru_claim_no_duplicates()
-    test_cap_spill_priority_and_populate()
+    test_cap_spill_is_rationed()
     test_facet_rotation_still_works()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
