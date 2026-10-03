@@ -44,11 +44,23 @@ _ALPHA = "abcdefghijklmnopqrstuvwxyz"
 # ORDER = measured yield (new rows per search; tools/idgap_stats.py leaderboard),
 # best first, so each agent's rotation front-loads the earners.
 # web-dl / dvdscr REMOVED: 290+ tries each, 0 rows ever returned by the site.
-_SPILL_QUALS = ("esub", "720p", "480p", "aac", "10bit", "2160p",
-                "1080p", "bluray", "hevc hd", "hevc", "webrip", "hdrip",
-                "bdrip")
-_SPILL_EXTRAS = ("zip", "s01", "e01", "hindi", "mkv", "dual audio",
-                 "tamil", "complete", "pack", "telugu")
+#
+# Yield leaderboard over 29,371 measured searches (new rows per search):
+#   1080p 0.68  esub 0.55  hindi 0.42  720p 0.38  mkv 0.33  season/episode
+#   0.35  zip 0.21  2160p 0.21  hevc 0.18  bluray 0.17  aac 0.16  tamil 0.14
+#   hevc-hd 0.12  10bit 0.11
+#   --- dropped, all measured below 0.10 new rows/search ---
+#   dual-audio 0.093  webrip 0.083  480p 0.071  hdrip 0.026  telugu 0.021
+#   complete 0.019  pack 0.017  bdrip 0.006
+# Those eight ate 8,598 searches — 29% of all traffic — for 361 new rows
+# (5.6%). Dropping them redirects that budget to lanes yielding ~0.28.
+_SPILL_QUALS = ("esub", "720p", "aac", "10bit", "2160p",
+                "1080p", "bluray", "hevc hd", "hevc")
+_SPILL_EXTRAS = ("zip", "s01", "e01", "hindi", "mkv", "tamil")
+# The cap-spill reaction fires when a search returns the full 50 rows, which
+# proves the head is hot. Queue that head's best-yielding slices, not just
+# the first N of the rotation.
+_SPILL_REACTION = ("esub", "1080p", "hindi", "720p", "mkv", "zip", "s01")
 # Episode fanout: every other season/episode of a vaulted series is an
 # UNSEARCHED sub-50 slice — the season axis, like facets on the quality axis.
 _EP_SUFFIXES = tuple([f"s{n:02d}" for n in range(1, 8)]
@@ -483,7 +495,7 @@ class IdGapMiner:
         if len(rows) >= 50:
             head = term.rsplit(" ", 1)[0] if " " in term else term
             with self._lock:
-                for f in _SPILL_QUALS[:6] + ("zip", "s01"):
+                for f in _SPILL_REACTION:
                     t2 = f"{head} {f}"
                     if t2 != term and t2 not in self._spill_queue:
                         self._spill_queue.append(t2)
@@ -509,6 +521,12 @@ class IdGapMiner:
                             f"{info['new']} new, {info.get('in_block', 0)} in-block "
                             f"({info['took_s']}s)  cov={self.stats.get('coverage_last')}%",
                             flush=True)
+                        # gap_s between SUCCESSFUL searches too. It used to be
+                        # applied only on retry, which made MKV_IDGAP_GAP_S
+                        # dead config: 8 agents ran flat out (84 searches/min,
+                        # measured) and monopolised both HTTP slots, starving
+                        # the discovery lane completely.
+                        stop.wait(self.gap_s)
                     elif info.get("status") == "retry":
                         log(f"[idgap:{agent}] RETRY {info.get('term')}: "
                             f"{info.get('err')}", flush=True)

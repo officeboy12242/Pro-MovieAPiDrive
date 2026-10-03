@@ -49,7 +49,20 @@ class _PrioritySemaphore:
     """A threading.Semaphore whose waiters wake in priority order (lower
     value first) instead of FIFO. Keeps the 2-slot HTTP budget pointed at
     the highest-yield lanes: the recents watcher never queues behind bulk
-    discovery, and idgap seed searches beat low-priority probes."""
+    discovery, and idgap seed searches beat low-priority probes.
+
+    Priority alone is NOT starvation-safe, and that is not hypothetical: idgap
+    runs 8 agents that never sleep between successful searches, so its waiters
+    keep the heap non-empty and every released token goes to lane 1. Discovery
+    (lanes 2/3) then waits on ev.wait() forever -- measured live: 3 completed
+    searches in 17 minutes, one step logging 142.0s, all of it queue wait,
+    while idgap ran 84 searches/min. So a waiter's effective priority AGES:
+    every AGING_S of waiting it gains one level, which guarantees any lane
+    reaches the front within (levels x AGING_S) no matter how loud the
+    higher-priority lanes are. Re-heapified on release (waiters are ~12).
+    """
+
+    AGING_S = float(os.getenv("MKV_HTTP_AGING_S", "20"))
 
     def __init__(self, value: int = 1):
         import heapq
@@ -57,7 +70,11 @@ class _PrioritySemaphore:
         self._cond = threading.Condition()
         self._tokens = value
         self._seq = 0
-        self._waiters: list = []  # heap of (priority, seq, event)
+        # heap of (effective_priority, seq, event, arrived_at, base_priority)
+        self._waiters: list = []
+
+    def _effective(self, arrived_at: float, base_priority: int, now: float) -> int:
+        return base_priority - int((now - arrived_at) / self.AGING_S)
 
     def acquire(self, priority: int = 3, timeout: float | None = None) -> bool:
         with self._cond:
@@ -66,7 +83,10 @@ class _PrioritySemaphore:
                 return True
             ev = threading.Event()
             self._seq += 1
-            self._heapq.heappush(self._waiters, (priority, self._seq, ev))
+            now = time.time()
+            self._heapq.heappush(
+                self._waiters,
+                (self._effective(now, priority, now), self._seq, ev, now, priority))
         # wait OUTSIDE the condition lock or release() can never run
         ok = ev.wait(timeout) if timeout else ev.wait()
         if not ok:  # timed out: remove ourselves so the token is not lost
@@ -78,7 +98,12 @@ class _PrioritySemaphore:
     def release(self) -> None:
         with self._cond:
             if self._waiters:
-                _, _, ev = self._heapq.heappop(self._waiters)
+                now = time.time()
+                self._waiters = [
+                    (self._effective(arrived, base, now), seq, ev, arrived, base)
+                    for (_eff, seq, ev, arrived, base) in self._waiters]
+                self._heapq.heapify(self._waiters)
+                _, _, ev, _, _ = self._heapq.heappop(self._waiters)
                 ev.set()
             else:
                 self._tokens += 1
