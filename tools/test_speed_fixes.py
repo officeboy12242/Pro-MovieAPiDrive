@@ -1,7 +1,9 @@
 #!/usr/bin/env python
-"""OFFLINE unit tests for the two speed fixes (LRU-valve claim +
-cap-spill reaction). No network, no Mongo, no effect on the running
-fleet. Run: .venv/Scripts/python.exe tools/test_speed_fixes.py"""
+"""OFFLINE unit tests for the crawl-speed fixes: the LRU-valve claim and
+cap-spill reaction, HTTP-slot anti-starvation, the trimmed facet
+vocabulary, and discovery lane selection. No network, no Mongo, no effect
+on the running fleet.
+Run: .venv/Scripts/python.exe tools/test_speed_fixes.py"""
 from __future__ import annotations
 
 import os
@@ -16,6 +18,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.idgap import (  # noqa: E402
     IdGapMiner, _SPILL_EXTRAS, _SPILL_QUALS, _SPILL_REACTION)
 from app.client import _PrioritySemaphore  # noqa: E402
+from app.discovery import Discovery, _ALPHA  # noqa: E402
+
+
+def make_discovery():
+    """A Discovery with lanes wired but no Mongo/client (offline only)."""
+    from app.discovery import _LANES
+    d = Discovery.__new__(Discovery)
+    d._qlock = threading.RLock()
+    d.lanes = {k: [] for k in _LANES}
+    d.queued_set = set()
+    d.known_terms = set()
+    d.exhausted = set()
+    d.max_word_len = 48
+    return d
 
 
 def make_miner() -> IdGapMiner:
@@ -181,6 +197,56 @@ def test_priority_still_beats_a_fresh_low_priority_waiter() -> None:
           "older-queued lane 3")
 
 
+def test_priority_backlog_cannot_shadow_the_probe_lanes() -> None:
+    """priority holds ~31k vault-derived terms and used to be spliced in at
+    position 2 for EVERY agent, so series/alpha/words/facet served zero
+    searches between them across 5,437 measured steps."""
+    d = make_discovery()
+    d.lanes["priority"] = [f"vault head {i}" for i in range(50)]
+    for t in d.lanes["priority"]:
+        d.queued_set.add(t)
+    d.lanes["series"] = ["ca t "]
+    d.queued_set.add("ca t ")
+    got = d._pop("series")
+    assert got == ("ca t ", "series"), got
+    # with its own lane empty the agent still gets it, priority is the backstop
+    d2 = make_discovery()
+    d2.lanes["priority"] = ["vault head"]
+    d2.queued_set.add("vault head")
+    assert d2._pop("series") == ("vault head", "priority")
+    # and priority is reachable last, never shadowed away
+    d3 = make_discovery()
+    d3.lanes["alpha"] = ["abc"]
+    d3.lanes["words"] = ["drama"]
+    d3.queued_set.update({"abc", "drama"})
+    assert d3._pop("alpha") == ("abc", "alpha")
+    assert d3._pop("alpha") == ("drama", "words")
+    print("PASS  _pop: own lane first, other exploratory lanes next, "
+          "priority last")
+
+
+def test_capped_letter_expansion_keeps_the_prefix_space() -> None:
+    """'ca t ' returns 50 rows (prefix match on the final token); 'ca t'
+    returns 0 (whole-token AND). _queue() strips the trailing space via
+    _norm_term, so the old expansion minted 26 guaranteed-zero searches."""
+    d = make_discovery()
+    rows = [{"title": f"Captain America Part {i} 2016 1080p", "created_at": "2016-01-01"}
+            for i in range(50)]
+    added = d._spill_capped("ab", 50, rows)
+    assert added == 26, added
+    assert len(d.lanes["series"]) == 26, d.lanes["series"]
+    assert not d.lanes["alpha"], d.lanes["alpha"]
+    assert all(t.endswith(" ") for t in d.lanes["series"]), d.lanes["series"][:3]
+    assert f"ab{_ALPHA[0]} " in d.lanes["series"], d.lanes["series"][:3]
+    # and the old, dead form must never reappear
+    d2 = make_discovery()
+    d2._spill_capped("ab", 50, rows)
+    assert not any(t == f"ab{c}" for t in
+                   d2.lanes["series"] + d2.lanes["alpha"] for c in _ALPHA)
+    print("PASS  capped letter probe expands to 26 live prefix probes "
+          "(was 26 whole-token terms that return 0 rows)")
+
+
 if __name__ == "__main__":
     test_lru_claim_no_duplicates()
     test_cap_spill_is_rationed()
@@ -188,6 +254,8 @@ if __name__ == "__main__":
     test_dead_facets_are_gone()
     test_low_priority_lane_cannot_be_starved()
     test_priority_still_beats_a_fresh_low_priority_waiter()
+    test_priority_backlog_cannot_shadow_the_probe_lanes()
+    test_capped_letter_expansion_keeps_the_prefix_space()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
     assert d.count(b"\x00") == 0, "ROT in idgap.py"

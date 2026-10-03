@@ -458,11 +458,23 @@ class Discovery:
         return self._queue(t, max_len=80, front=True, lane=lane)
 
     def _pop(self, prefer: str | None = None) -> tuple[str, str] | None:
-        """Honor each agent's lane; dedicated year/day agents must not starve."""
+        """Each agent drains its own lane first, then the other exploratory
+        lanes, and only then the deep `priority` backlog.
+
+        `priority` used to be spliced in at position 2 for EVERY agent. It is
+        fed by _mine()/seed_titles() from titles we already hold and holds
+        ~31k terms, so a dedicated-lane agent drained its own queue and then
+        fell straight into it. Measured over 5,437 discovery steps: series,
+        alpha, words and facet served ZERO searches between them, while the
+        year lane served 1,784 for 19 new rows (0.011/search). priority is the
+        deep backstop and cannot starve -- its backlog dwarfs every other lane
+        combined -- so putting it LAST gives the exploratory lanes first
+        refusal without putting anything at risk.
+        """
         order = [prefer] if prefer in _LANES else []
+        order += [k for k in _LANES if k not in order and k != "priority"]
         if "priority" not in order:
             order.append("priority")
-        order += [k for k in _LANES if k not in order]
         with self._qlock:
             for lane in order:
                 if not self.lanes.get(lane):
@@ -795,8 +807,14 @@ class Discovery:
         if _YEAR_TERM.match(bare) or _YEAR_SLICE_TERM.match(bare):
             added += self._spill_capped_year(bare)
         if bare.isalpha() and 1 <= len(bare) <= 3 and bare not in _FACET_SET:
+            # MUST go through _queue_probe: the site prefix-matches the final
+            # token when the query ends in a space ('ca t ' -> 'Captain
+            # America...', 50 rows) and whole-token-ANDs otherwise ('ca t' ->
+            # 0 rows, measured). _queue() normalises through _norm_term, which
+            # strips that space, so the old expansion minted 26 guaranteed-zero
+            # searches per capped letter probe.
             for c in _ALPHA:
-                if self._queue(bare + c, front=True, min_len=1, lane="alpha"):
+                if self._queue_probe(bare + c):
                     added += 1
         # bare facet at cap -> try pairing with recent years (zip + 2024..)
         if bare in _FACET_SET or _FACET_SEASON.match(bare):
@@ -1058,10 +1076,15 @@ class Discovery:
         # day-walk seeds first day then _boost_hot (pins lanterns etc. after pull)
         threading.Thread(target=self._day_loop, args=(log,), daemon=True,
                          name="disc-daywalk").start()
-        # Lane plan: discovery keeps ONLY trending/priority + day + year agents;
-        # everything else (alpha/words/facet/series bulk) is mined by idgap's
-        # seed-head searches (~6 new rows/search vs ~0.5 for probes).
-        prefer_cycle = ("priority", "year", "day")
+        # Lane plan, from measured per-lane yield over 5,437 discovery steps:
+        #   priority 0.24-0.27 new/search  <- the only lane that produced
+        #   year     0.011                 <- 1,784 searches for 19 rows
+        #   series/alpha/words/facet      <- 0 searches, starved by _pop
+        # `series` holds the 1,600+ prefix probes ('ca t ') — the only terms
+        # that exploit the site's trailing-space prefix matching and so the
+        # only strategy that can enumerate titles we have never heard of.
+        # `year` is retired: it was a third of the traffic for nothing.
+        prefer_cycle = ("priority", "series", "words")
         for i in range(n):
             prefer = prefer_cycle[i % len(prefer_cycle)]
             threading.Thread(target=self._agent_loop, args=(i, prefer, log),
