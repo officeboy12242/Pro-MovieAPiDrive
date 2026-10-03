@@ -74,6 +74,99 @@ _NOISE = _re.compile(
     r"gdflix|hubcloud|hdrip|camrip|dvdscr|www\.|\.com|\.in\b|downloaded",
     _re.I)
 
+# ---------------------------------------------------------------------------
+# Token sweep: the one lever that reaches ids OLDER than the newest-50 window.
+#
+# mkvbase search always returns the site's newest 50 matches for a query, so a
+# query with more than 50 total matches can never surface an old row. A query
+# with <= 50 total matches returns its COMPLETE match set. Measured on the live
+# site over three independent random samples (n=24-30 each): 7.1, 8.0 and 10.0
+# NEW rows per search, 0% duplicate share, and every recovered row was an
+# INTERIOR id (the missing middle of the id space) -- against 0.02-0.27/search
+# for every lane this miner already runs. Measured again through THIS pool
+# (23,097 tokens, random sample n=20): 5.30 new rows/search, 7/20 capped.
+# Lower than the probes because the pool is broader (len 3-24, punctuation and
+# numeric-suffix junk included); still ~29x the idgap lane.
+#
+# The vault is 44% full (244k of 547k ids) and the 303k gaps are scattered as
+# runs of 1-9 ids, so no id range is contiguous enough to walk. This sweep is
+# the only strategy that reaches them: it searches tokens the fleet already
+# holds in title_tokens but has never sent to the site.
+_TOKEN_MIN_FREQ = 2     # freq 1 is typos/random strings (measured: no yield)
+_TOKEN_MAX_FREQ = 50    # <= 50 total matches => the search returns ALL of them
+_TOKEN_MIN_LEN = 4
+_TOKEN_MAX_LEN = 24
+_TOKEN_POOL_TTL = 6 * 3600
+_FRONTIER_CAP = 500     # bounded queue of tokens found only in recovered rows
+_TOKEN_SPLIT = _re.compile(r"[^a-z0-9]+")
+# Very common English words match far more than 50 rows on the site, so they
+# can never surface an unseen row -- and the frontier mints them constantly
+# (measured live: 'you' and 'know' both returned 50 rows / 0 new). They are
+# legal terms for the pool (rare titles use them) but must not consume the
+# frontier, whose whole value is that its tokens were unseen by construction.
+_TOKEN_COMMON = frozenset((
+    "you", "your", "yours", "know", "like", "just", "that", "this", "these",
+    "those", "with", "from", "have", "here", "there", "where", "when",
+    "what", "which", "while", "will", "would", "could", "should", "does",
+    "done", "been", "being", "were", "was", "are", "the", "and", "for",
+    "but", "not", "all", "any", "can", "her", "his", "its", "our", "out",
+    "she", "him", "how", "who", "why", "too", "very", "into", "over",
+    "only", "also", "then", "than", "them", "they", "their", "some",
+    "more", "most", "much", "many", "one", "two", "new", "old", "get",
+    "got", "make", "made", "take", "took", "come", "came", "see", "saw",
+    "way", "day", "night", "life", "time", "year", "man", "woman",
+    "boy", "girl", "king", "love", "war", "world", "home", "house",
+    "part", "last", "first", "next", "back", "down", "off", "own",
+    "about", "after", "again", "against", "before", "between", "during",
+    "under", "never", "every", "each", "both", "because", "through",
+    "story", "full", "true", "best", "good", "great", "little", "long",
+    "red", "blue", "black", "white", "dark", "light", "fire", "blood",
+))
+# Facet/format vocabulary is already covered by the facet and cap-spill lanes;
+# re-searching it here would just re-burn the same capped queries.
+_RE_QUALITY_RE = _re.compile(r"(?:^|[^a-z])(?:bdrip|dvdrip|hdrip|webdl|webrip|4k|1080p|720p|2160p|x264|x265|hevc|aac|ac3|truehd|dts)")
+
+_TOKEN_STOP = frozenset((
+    "www", "com", "net", "org", "http", "https",
+    "mkv", "mp4", "avi", "mov", "srt", "sub", "subs", "esub", "msub",
+    "1080p", "720p", "480p", "2160p", "1080i", "uhd", "hdr", "sdr",
+    "hevc", "x264", "x265", "aac", "ac3", "ddp", "dts", "truehd",
+    "bluray", "brrip", "webrip", "webdl", "hdrip", "dvdrip", "hdtv",
+    "hindi", "tamil", "telugu", "malayalam", "kannada", "english",
+    "multi", "dual", "audio", "season", "episode", "complete", "pack",
+    "zip", "rar", "movie", "movies", "series", "ep", "eps", "vol",
+))
+
+
+def _has_brackets(title: str) -> bool:
+    """True when a row title is wrapped in a release-site bracket group like
+    '[HubCloud]'. Those bracketed groups carry the site's own quality/identity
+    annotation and must never become search terms."""
+    return "[" in title or "]" in title
+
+
+def _terms_of(title: str) -> list[str]:
+    """Searchable tokens of a raw row title (fully lowercase alpha, len 4+).
+
+    Filters out junk that pollutes the sweep with capped, zero-yield queries,
+    including quality/format suffixes (hdrip, dvdrip, x264, ...), format labels
+    (web, dl, mkv, ...), 2-3 letter abbreviations, and bracketed release sites
+    (the site mangles title text into bracketed groups). All of these match
+    far more than 50 rows on the site and can never surface an unseen one.
+    """
+    t = (title or "").lower()
+    if len(t) < _TOKEN_MIN_LEN:
+        return []
+    out = []
+    for piece in _TOKEN_SPLIT.split(t):
+        # A real searchable English word is fully lowercase alpha, len 4+,
+        # and carries no quality/format code as a piece.
+        if (piece.isalpha() and len(piece) >= 4 and len(piece) <= _TOKEN_MAX_LEN
+                and piece not in _TOKEN_STOP and not _RE_QUALITY_RE.search(piece)
+                and not _has_brackets(title)):
+            out.append(piece)
+    return out
+
 
 def _title_head(title: str) -> str | None:
     """Clean searchable head of a row title: cut at year/season, keep the words
@@ -100,6 +193,15 @@ class IdGapMiner:
     spill_every = 3
     blocks_scan = 10
     _pick = 0
+    # Token sweep (see _TOKEN_* above). Class defaults keep _next_terms()
+    # usable when __init__ is skipped (the offline unit tests do that).
+    token_every = 1
+    token_batch = 400
+    _token_pool: list[str] = []
+    _token_ts = 0.0
+    _token_cursor = 0
+    _token_pick = 0
+    _token_frontier: deque = deque(maxlen=_FRONTIER_CAP)
 
     def __init__(self, client: MkvbaseClient, index, state_dir: str):
         self.client = client
@@ -141,6 +243,15 @@ class IdGapMiner:
         # How many thin blocks one call may consider when picking a head.
         self.blocks_scan = max(1, int(os.getenv("MKV_IDGAP_BLOCKS_SCAN", "10")))
         self._pick = 0
+        # Token sweep: serve it every Nth pick (default every pick -- measured
+        # 7-10 new rows/search vs 0.02-0.27 for every other lane here).
+        self.token_every = max(1, int(os.getenv("MKV_IDGAP_TOKEN_EVERY", "1")))
+        self.token_batch = max(10, int(os.getenv("MKV_IDGAP_TOKEN_BATCH", "400")))
+        self._token_pool = []
+        self._token_ts = 0.0
+        self._token_cursor = 0
+        self._token_pick = 0
+        self._token_frontier = deque(maxlen=_FRONTIER_CAP)
 
     # ------------------------------------------------------------ state
     def _load(self) -> None:
@@ -153,6 +264,9 @@ class IdGapMiner:
             self.term_stats = d.get("term_stats") or {}
             self.round_started = float(d.get("round_started") or 0)
             self.stats.update(d.get("stats") or {})
+            self._token_cursor = int(d.get("token_cursor") or 0)
+            self._token_frontier = deque(d.get("token_frontier") or [],
+                                         maxlen=_FRONTIER_CAP)
         except Exception:
             pass
 
@@ -165,7 +279,9 @@ class IdGapMiner:
                                "searched_terms": self.searched_terms,
                                "term_stats": self.term_stats,
                                "round_started": self.round_started,
-                               "stats": self.stats}, f)
+                               "stats": self.stats,
+                               "token_cursor": self._token_cursor,
+                               "token_frontier": list(self._token_frontier)}, f)
             except Exception:
                 pass
 
@@ -343,6 +459,105 @@ class IdGapMiner:
             out.append(f"{a} {years[0]}")
         return out
 
+    # ------------------------------------------------------------ token sweep
+    def _token_pool_build(self) -> list[str]:
+        """Tokens we already hold but have NEVER sent to the site, best first.
+
+        Only tokens whose vault frequency is <= _TOKEN_MAX_FREQ can pay off: the
+        site returns the newest 50 matches, so a token matching >50 rows can
+        never surface one we are missing. Frequency is also the cost signal --
+        a token matching ~40 rows is a much cheaper complete enumeration than
+        one matching 4 -- so the pool is ordered by descending frequency.
+
+        The aggregation is server-side and group-only (~38k groups, ~1-2s);
+        socketTimeoutMS is 20s, and the pool is cached for _TOKEN_POOL_TTL.
+        """
+        now = time.time()
+        # Cache first: this is called on every pick, and the aggregation below
+        # is the most expensive query the miner runs.
+        if self._token_pool and now - self._token_ts < _TOKEN_POOL_TTL:
+            return self._token_pool
+        idx = getattr(self, "index", None)
+        if idx is None:
+            return []
+        cols = list(getattr(idx, "cols", lambda: [self._col()])())
+        cols = [c for c in cols if c is not None]
+        if not cols:
+            return []
+        freq: Counter = Counter()
+        for c in cols:
+            for r in c.aggregate([
+                    {"$match": {"title_tokens": {"$exists": True}}},
+                    {"$unwind": "$title_tokens"},
+                    {"$group": {"_id": "$title_tokens", "n": {"$sum": 1}}}]):
+                t = r.get("_id")
+                if t:
+                    freq[t] += r["n"]
+        with self._lock:
+            searched = self.searched_terms
+            fresh = [t for t, n in freq.items()
+                     if (_TOKEN_MIN_FREQ <= n <= _TOKEN_MAX_FREQ
+                         and _TOKEN_MIN_LEN <= len(t) <= _TOKEN_MAX_LEN
+                         and not t.isdigit() and t not in _TOKEN_STOP
+                         and t not in searched)]
+        fresh.sort(key=lambda t: -freq[t])
+        self._token_pool = fresh
+        self._token_ts = now
+        return fresh
+
+    def _claim_token(self) -> tuple[str, str] | None:
+        """Claim one sweep token: (term, kind) or None when both lanes are dry.
+
+        Pool first: measured 4.17 new rows/search live vs 2.62 for the frontier,
+        and it holds ~23k tokens, so it is the budget for the next day or so.
+        Frontier second, as the fallback that carries the sweep once the pool is
+        exhausted -- its tokens were minted from rows the sweep itself recovered,
+        so they are queries the vault could not have generated any other way.
+        """
+        now = time.time()
+        with self._lock:
+            self._token_pick += 1
+        pool = self._token_pool_build()
+        if pool:
+            with self._lock:
+                n = len(pool)
+                for i in range(self._token_cursor,
+                               self._token_cursor + self.token_batch):
+                    t = pool[i % n]
+                    if now - self.searched_terms.get(t, 0.0) > self.term_ttl_s:
+                        self._token_cursor = i + 1
+                        self.searched_terms[t] = now
+                        return t, "token-sweep"
+        with self._lock:
+            while self._token_frontier:
+                t = self._token_frontier.popleft()
+                if now - self.searched_terms.get(t, 0.0) <= self.term_ttl_s:
+                    continue  # raced or already done
+                self.searched_terms[t] = now
+                return t, "token-frontier"
+        return None
+
+    def _drain_token_hits(self, rows: list[dict]) -> None:
+        """Mint search keys from rows the sweep just recovered.
+
+        Every token here was absent from the whole vault, so it is by
+        construction a query the fleet has never run. Bounded queue; the TTL
+        check happens at pop time.
+        """
+        minted = 0
+        with self._lock:
+            for r in rows:
+                for t in _terms_of(r.get("title") or ""):
+                    if (t in _TOKEN_STOP or t in _TOKEN_COMMON
+                            or t in self.searched_terms
+                            or len(self._token_frontier) >= _FRONTIER_CAP):
+                        continue
+                    if _TOKEN_MIN_LEN <= len(t) <= _TOKEN_MAX_LEN:
+                        self._token_frontier.append(t)
+                        minted += 1
+        if minted:
+            self.stats["token_minted"] = self.stats.get("token_minted", 0) + minted
+
     def _next_terms(self, n: int, agent: str = "a1") -> tuple[int | None, str, list[str]]:
         cov = self.coverage()
         if not cov or not cov["thin_blocks"]:
@@ -355,6 +570,19 @@ class IdGapMiner:
         with self._lock:
             self._pick += 1
             allow_spill = (self._pick % self.spill_every == 0)
+            allow_token = (self._pick % self.token_every == 0)
+        # TOKEN SWEEP FIRST. Measured on the live site: 7.1-10.0 NEW rows per
+        # search (0% duplicate share, every row an interior id) against
+        # 0.02-0.27 for every lane below. It is gated rather than unconditional
+        # so the thin-block lanes keep running, but it earns the pick whenever
+        # its gate opens and it still has unsearched tokens.
+        if allow_token:
+            got = self._claim_token()
+            if got:
+                term, kind = got
+                self.stats["picked_block"] = None
+                self.stats["picked_era"] = "token-sweep"
+                return None, "token-sweep", [f"tok:{kind}:{term}"]
         # CAP-SPILL REACTION: slices queued when a search hit the 50-row site
         # cap. Rationed -- see self.spill_every.
         if allow_spill:
@@ -464,10 +692,18 @@ class IdGapMiner:
         if not terms:
             return {"status": "idle", "agent": agent}
         raw = terms[0]
-        term = raw[5:] if raw.startswith("seed:") else raw
-        kind = ("seed-spill" if term.endswith(_SPILL_QUALS + _SPILL_EXTRAS)
-                else ("seed-ep" if term.endswith(_EP_SUFFIXES)
-                      else self._term_kind(term)))
+        forced_kind = None
+        if raw.startswith("tok:"):
+            # 'tok:<kind>:<term>' -- the kind is carried explicitly so a bare
+            # token is not mislabelled 'seed-head' by _term_kind().
+            _, forced_kind, term = raw.split(":", 2)
+        elif raw.startswith("seed:"):
+            term = raw[5:]
+        else:
+            term = raw
+        kind = forced_kind or ("seed-spill" if term.endswith(_SPILL_QUALS + _SPILL_EXTRAS)
+                               else ("seed-ep" if term.endswith(_EP_SUFFIXES)
+                                     else self._term_kind(term)))
         t0 = time.time()
         try:
             obj = self.client.search(term)
@@ -478,6 +714,10 @@ class IdGapMiner:
                     "err": f"{type(e).__name__}: {str(e)[:100]}"}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
         new, _upd = self.index.upsert(rows, source=f"idgap:{agent}:b{blk}")
+        if kind.startswith("token-"):
+            # Rows the sweep just recovered carry tokens the vault has never
+            # held -- free, self-generated search keys for the next pass.
+            self._drain_token_hits(rows)
         in_block = sum(1 for r in rows
                        if blk is not None and blk * self.block <= (r.get("id") or 0)
                        < (blk + 1) * self.block)

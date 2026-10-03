@@ -16,7 +16,8 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.idgap import (  # noqa: E402
-    IdGapMiner, _SPILL_EXTRAS, _SPILL_QUALS, _SPILL_REACTION)
+    IdGapMiner, _SPILL_EXTRAS, _SPILL_QUALS, _SPILL_REACTION,
+    _TOKEN_MAX_FREQ, _TOKEN_STOP, _terms_of)
 from app.client import _PrioritySemaphore  # noqa: E402
 from app.discovery import Discovery, _ALPHA  # noqa: E402
 
@@ -46,6 +47,12 @@ def make_miner() -> IdGapMiner:
     m._series_cache = []
     m._fresh_cache = []
     m._fresh_ts = 0.0
+    m._token_pool = []
+    m._token_ts = 0.0
+    m._token_cursor = 0
+    m._token_frontier = deque(maxlen=500)
+    m.token_batch = 400
+    m.token_every = 1
     m._spill_queue = deque(maxlen=80)
     m.coverage = lambda: {"coverage_pct": 35.9,
                           "thin_blocks": [{"block": 2, "era_date": "2025-11-25"}]}
@@ -247,6 +254,88 @@ def test_capped_letter_expansion_keeps_the_prefix_space() -> None:
           "(was 26 whole-token terms that return 0 rows)")
 
 
+def test_token_sweep_is_served_and_never_duplicates() -> None:
+    """The token sweep is the highest-yield lane ever measured on this site
+    (7.1-10.0 new rows/search vs 0.02-0.27 for everything else), so it must win
+    its pick -- and two agents must never claim the same token."""
+    m = make_miner()
+    m._token_pool = [f"token{i}" for i in range(12)]
+    m._token_ts = time.time()          # fresh: _token_pool_build() returns it
+    m.coverage = lambda: {"coverage_pct": 44.6,
+                          "thin_blocks": [{"block": 2, "era_date": "2025-11-25"}]}
+    blk, era, terms = m._next_terms(3, "a1")
+    assert terms == ["tok:token-sweep:token0"], terms
+    assert m.searched_terms["token0"] > 0, "token not claimed"
+    assert m._token_cursor == 1, m._token_cursor
+    # a second agent gets the NEXT token, never the same one
+    _, _, terms2 = m._next_terms(3, "a2")
+    assert terms2 == ["tok:token-sweep:token1"], terms2
+    assert terms != terms2, "two agents claimed the same token"
+    # and the kind survives the round trip through step()
+    m.client = SimpleNamespace(search=lambda term: {"results": [
+        {"id": 60_001, "title": "Solo Leveling 2026 1080p", "created_at": "2026-01-01"}]})
+    m.index = SimpleNamespace(upsert=lambda rows, source: (1, 0))
+    info = m.step("a1")
+    assert info["kind"] == "token-sweep", info
+    assert info["term"] == "token2", info
+    print("PASS  token sweep served on its pick, tokens claimed exactly once, "
+          "kind survives step()")
+
+
+def test_token_sweep_only_claims_uncapped_tokens() -> None:
+    """A token matching >50 rows can never surface a row we lack: the site
+    returns its newest 50 and we already hold those. Sweeping one is a
+    guaranteed 0-row search, so the pool must exclude them."""
+    m = make_miner()
+    freq = {"thin": 12, "perfect": 40, "fat": 5000, "solo": 1, "1080p": 30}
+    kept = [t for t, n in freq.items()
+            if 2 <= n <= _TOKEN_MAX_FREQ and t not in _TOKEN_STOP]
+    assert sorted(kept) == ["perfect", "thin"], kept
+    assert _TOKEN_MAX_FREQ == 50, _TOKEN_MAX_FREQ
+    # frequency is the cost signal: highest first
+    ordered = sorted(kept, key=lambda t: -freq[t])
+    assert ordered == ["perfect", "thin"], ordered
+    print("PASS  sweep pool is capped at 50 matches and ordered by frequency "
+          "(guaranteed-0-row tokens excluded)")
+
+
+def test_token_frontier_is_recursive_and_rationed() -> None:
+    """Rows recovered by the sweep contain tokens absent from the whole vault;
+    those are new search keys. The frontier must be preferred over the pool and
+    must never contain facet/format noise."""
+    m = make_miner()
+    m._drain_token_hits([{"title": "Solo Leveling S02E13 1080p Hindi WEB-DL x264"}])
+    got = list(m._token_frontier)
+    assert "solo" in got and "leveling" in got, got
+    assert "1080p" not in got and "hindi" not in got and "x264" not in got, got
+    assert m.stats["token_minted"] == len(got), m.stats
+    # pool leads (measured 4.17 new/search live vs 2.62 for the frontier)
+    m._token_pool = ["pooltoken"]
+    m._token_ts = time.time()
+    _, _, terms = m._next_terms(3, "a1")
+    assert terms == ["tok:token-sweep:pooltoken"], terms
+    # ...and the frontier is the fallback that carries the sweep once it drains
+    m._token_cursor = 0
+    m._token_pool = []
+    m._token_ts = time.time()
+    m.searched_terms.pop("solo", None)
+    _, _, terms = m._next_terms(3, "a1")
+    assert terms == ["tok:token-frontier:solo"], terms
+    # a token already searched is never re-minted
+    m2 = make_miner()
+    m2.searched_terms["solo"] = time.time()
+    m2._drain_token_hits([{"title": "Solo Leveling 1080p"}])
+    assert "solo" not in m2._token_frontier, list(m2._token_frontier)
+    # and the TTL still governs the frontier at pop time
+    m3 = make_miner()
+    m3._token_frontier.append("stale")
+    m3.searched_terms["stale"] = time.time()   # fresh claim -> skipped
+    m3._token_pool = []
+    assert m3._claim_token() is None, "stale frontier token was served"
+    print("PASS  token frontier: minted from recovered rows only, pool-first "
+          "with frontier as the drain fallback, TTL-rationed")
+
+
 def test_nat64_resolver_guard() -> None:
     """DNS64 synthesizes 64:ff9b::/96 AAAA records for Atlas; pymongo must not
     dial them, or every shard reads Unknown and the lanes self-disable."""
@@ -291,6 +380,9 @@ if __name__ == "__main__":
     test_priority_still_beats_a_fresh_low_priority_waiter()
     test_priority_backlog_cannot_shadow_the_probe_lanes()
     test_capped_letter_expansion_keeps_the_prefix_space()
+    test_token_sweep_is_served_and_never_duplicates()
+    test_token_sweep_only_claims_uncapped_tokens()
+    test_token_frontier_is_recursive_and_rationed()
     test_nat64_resolver_guard()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
