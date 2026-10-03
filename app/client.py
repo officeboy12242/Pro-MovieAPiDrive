@@ -237,6 +237,8 @@ class MkvbaseClient:
         if not uri:
             return None
         try:
+            from .store import prefer_mongo_ipv4
+            prefer_mongo_ipv4()
             from pymongo import MongoClient
             return MongoClient(uri, serverSelectionTimeoutMS=8000, socketTimeoutMS=20000,
                                maxPoolSize=2)[os.getenv("MKV_MONGO_DB", "mkvbase")].sessions

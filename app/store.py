@@ -7,12 +7,77 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 
 
 # Keys identifying a row across scrape shapes (id is authoritative when present).
 _KEYS = ("id", "url", "title")
+
+
+# --- Mongo reachability guard ------------------------------------------
+# On DNS64/NAT64 networks the resolver answers Atlas' A records with a
+# synthesized AAAA in the well-known NAT64 prefix 64:ff9b::/96. If the local
+# NAT64 gateway is absent or black-holing, pymongo dials those addresses,
+# every server stays `Unknown`, and the driver dies with
+# "No replica set members found yet" -- even though plain IPv4 to the same
+# host:27017 connects fine. Symptom: [index] MongoDB unreachable, then
+# [idgap]/[discovery] DISABLED (no durable index, so nothing reaches Render).
+# Dropping the synthesized records makes the driver use the real A record.
+_NAT64_PREFIX = b"\x00\xff\x9b"  # 64:ff9b::/96 first 3 bytes
+_ipv4_only_installed = False
+
+
+def _is_nat64(addr) -> bool:
+    """True for an IPv6 address inside the NAT64 prefix 64:ff9b::/96.
+
+    getaddrinfo hands back AF_INET6 addresses as strings on Windows, so match the
+    text form; the packed 16-byte form is handled as a fallback.
+    """
+    if isinstance(addr, str):
+        parts = addr.split(":")
+        return len(parts) >= 3 and parts[0] == "64" and parts[1] == "ff9b" \
+            and parts[2] in ("", "0")
+    try:
+        raw = bytes(addr)[:16]
+    except (TypeError, ValueError):
+        return False
+    return len(raw) == 16 and raw[:3] == _NAT64_PREFIX
+
+
+def prefer_mongo_ipv4(force: bool | None = None) -> bool:
+    """Install a process-wide getaddrinfo filter that hides NAT64 addresses.
+
+    Idempotent and safe to call from every Mongo entry point. `force` overrides
+    the MKV_MONGO_IPV4_ONLY env var ("0"/"off"/"false" disables the filter,
+    "1"/"on"/"true" drops ALL IPv6 answers, unset = auto: only NAT64 records).
+    Returns True when the filter is in place.
+    """
+    global _ipv4_only_installed
+    if _ipv4_only_installed:
+        return True
+    if force is None:
+        raw = (os.getenv("MKV_MONGO_IPV4_ONLY") or "").strip().lower()
+        if raw in ("0", "off", "false", "no"):
+            return False
+        force = raw in ("1", "on", "true", "yes")
+    real = socket.getaddrinfo
+
+    def _filtered(host, port, *args, **kwargs):
+        try:
+            got = real(host, port, *args, **kwargs)
+        except Exception:
+            return got
+        kept = [r for r in got
+                if r[0] != socket.AF_INET6 or (not force and not _is_nat64(r[4][0]))]
+        return kept or got
+
+    socket.getaddrinfo = _filtered
+    _ipv4_only_installed = True
+    print("[mongo] resolver guard: %s" % ("IPv4-only" if force else "NAT64-filtered"),
+          flush=True)
+    return True
 
 
 def _site_tokens(q: str) -> list[str]:
@@ -256,6 +321,7 @@ class MongoIndex:
 
     def __init__(self, uri: str, db: str | None = None):
         from pymongo import DESCENDING, MongoClient
+        prefer_mongo_ipv4()
         self._DESC = DESCENDING
         self._client = MongoClient(uri, serverSelectionTimeoutMS=8000,
                                    socketTimeoutMS=20000, maxPoolSize=8)

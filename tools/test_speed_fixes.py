@@ -247,6 +247,41 @@ def test_capped_letter_expansion_keeps_the_prefix_space() -> None:
           "(was 26 whole-token terms that return 0 rows)")
 
 
+def test_nat64_resolver_guard() -> None:
+    """DNS64 synthesizes 64:ff9b::/96 AAAA records for Atlas; pymongo must not
+    dial them, or every shard reads Unknown and the lanes self-disable."""
+    import socket as sock
+    import app.store as store
+    from app.store import _is_nat64
+
+    assert _is_nat64("64:ff9b::2264:9139"), "NAT64 address not detected"
+    assert _is_nat64(bytes([0, 0xFF, 0x9B] + [0] * 13)), "packed NAT64 missed"
+    for good in ("2606:4700::1", "::1", "34.100.145.57", "2001:db8::1"):
+        assert not _is_nat64(good), f"real address misread as NAT64: {good}"
+
+    # A resolver answer set shaped like this box's: one real A record plus the
+    # NAT64 AAAA the resolver invented from it. The guard must drop only the
+    # synthetic one -- dropping the A record would make things worse.
+    real_answers = [(sock.AF_INET, 1, 6, "", ("34.100.145.57", 27017)),
+                    (sock.AF_INET6, 1, 6, "", ("64:ff9b::2264:9139", 27017)),
+                    (sock.AF_INET6, 1, 6, "", ("2606:4700::1", 27017))]
+    kept = [r for r in real_answers
+            if r[0] != sock.AF_INET6 or not _is_nat64(r[4][0])]
+    addrs = [r[4][0] for r in kept]
+    assert "64:ff9b::2264:9139" not in addrs, f"NAT64 survived the filter: {addrs}"
+    assert "34.100.145.57" in addrs, f"filter dropped the real A record: {addrs}"
+    assert "2606:4700::1" in addrs, f"filter dropped a genuine AAAA: {addrs}"
+
+    # Installing must be idempotent and must not recurse into itself.
+    before = sock.getaddrinfo
+    store.prefer_mongo_ipv4()
+    after = sock.getaddrinfo
+    assert after is not before, "guard did not install"
+    store.prefer_mongo_ipv4()
+    assert sock.getaddrinfo is after, "guard re-installed over itself"
+    print("PASS  NAT64 resolver guard: drops 64:ff9b::/96, keeps real A and AAAA, idempotent")
+
+
 if __name__ == "__main__":
     test_lru_claim_no_duplicates()
     test_cap_spill_is_rationed()
@@ -256,6 +291,7 @@ if __name__ == "__main__":
     test_priority_still_beats_a_fresh_low_priority_waiter()
     test_priority_backlog_cannot_shadow_the_probe_lanes()
     test_capped_letter_expansion_keeps_the_prefix_space()
+    test_nat64_resolver_guard()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
     assert d.count(b"\x00") == 0, "ROT in idgap.py"

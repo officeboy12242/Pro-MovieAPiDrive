@@ -75,6 +75,8 @@ def _mongo_col_cached():
         if not uri:
             return None
         try:
+            from .store import prefer_mongo_ipv4
+            prefer_mongo_ipv4()
             from pymongo import MongoClient
             c = MongoClient(uri, serverSelectionTimeoutMS=4000, socketTimeoutMS=15000)
             c.admin.command("ping")
