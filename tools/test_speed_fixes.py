@@ -6,6 +6,7 @@ on the running fleet.
 Run: .venv/Scripts/python.exe tools/test_speed_fixes.py"""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -54,6 +55,17 @@ def make_miner() -> IdGapMiner:
     m.token_batch = 400
     m.token_every = 1
     m._spill_queue = deque(maxlen=80)
+    m._phrase_pool = []
+    m._phrase_ts = 0.0
+    m._phrase_cursor = 0
+    m._phrase_ttl = 6 * 3600
+    m.phrase_batch = 400
+    m._phrase_frontier = deque(maxlen=500)
+    m._slice_pool = []
+    m._slice_ts = 0.0
+    m._slice_cursor = 0
+    m.slice_batch = 400
+    m._slice_queue = deque(maxlen=500)
     m.coverage = lambda: {"coverage_pct": 35.9,
                           "thin_blocks": [{"block": 2, "era_date": "2025-11-25"}]}
     m._seeds_for_block = (lambda blk, n=6, fresh_only=True:
@@ -254,32 +266,47 @@ def test_capped_letter_expansion_keeps_the_prefix_space() -> None:
           "(was 26 whole-token terms that return 0 rows)")
 
 
-def test_token_sweep_is_served_and_never_duplicates() -> None:
-    """The token sweep is the highest-yield lane ever measured on this site
-    (7.1-10.0 new rows/search vs 0.02-0.27 for everything else), so it must win
-    its pick -- and two agents must never claim the same token."""
+def test_token_sweep_never_duplicates_and_yields_to_seed_lanes() -> None:
+    """Tokens must still be claimed exactly once each -- but the sweep no
+    longer wins the pick. Measured 2026-10-04: the token pool is dry (174
+    eligible left of 29,187 searched) and the phrase pool measures 0.00
+    new/search, while seed-spill/seed-ep/other-season slices measure
+    2.4-3.7. The sweep is now last resort, so seed lanes get the pick first."""
     m = make_miner()
     m._token_pool = [f"token{i}" for i in range(12)]
     m._token_ts = time.time()          # fresh: _token_pool_build() returns it
     m.coverage = lambda: {"coverage_pct": 44.6,
                           "thin_blocks": [{"block": 2, "era_date": "2025-11-25"}]}
+    # seed lanes are available here (solo head exists), so they take the pick
     blk, era, terms = m._next_terms(3, "a1")
+    assert terms and terms[0].startswith("seed:"), (
+        f"sweep stole a pick a seed lane could take: {terms}")
+
+    # with every seed lane empty, the sweep takes the pick and still claims
+    # each token exactly once
+    m2 = make_miner()
+    m2._token_pool = [f"token{i}" for i in range(12)]
+    m2._token_ts = time.time()
+    m2._seeds_for_block = (lambda blk, n=6, fresh_only=True: [])
+    m2.coverage = lambda: {"coverage_pct": 44.6,
+                           "thin_blocks": [{"block": 2, "era_date": "2025-11-25"}]}
+    blk, era, terms = m2._next_terms(3, "a1")
     assert terms == ["tok:token-sweep:token0"], terms
-    assert m.searched_terms["token0"] > 0, "token not claimed"
-    assert m._token_cursor == 1, m._token_cursor
+    assert m2.searched_terms["token0"] > 0, "token not claimed"
+    assert m2._token_cursor == 1, m2._token_cursor
     # a second agent gets the NEXT token, never the same one
-    _, _, terms2 = m._next_terms(3, "a2")
+    _, _, terms2 = m2._next_terms(3, "a2")
     assert terms2 == ["tok:token-sweep:token1"], terms2
     assert terms != terms2, "two agents claimed the same token"
     # and the kind survives the round trip through step()
-    m.client = SimpleNamespace(search=lambda term: {"results": [
+    m2.client = SimpleNamespace(search=lambda term: {"results": [
         {"id": 60_001, "title": "Solo Leveling 2026 1080p", "created_at": "2026-01-01"}]})
-    m.index = SimpleNamespace(upsert=lambda rows, source: (1, 0))
-    info = m.step("a1")
+    m2.index = SimpleNamespace(upsert=lambda rows, source: (1, 0))
+    info = m2.step("a1")
     assert info["kind"] == "token-sweep", info
     assert info["term"] == "token2", info
-    print("PASS  token sweep served on its pick, tokens claimed exactly once, "
-          "kind survives step()")
+    print("PASS  sweep yields to seed lanes when they can run, claims each "
+          "token exactly once when they cannot, kind survives step()")
 
 
 def test_token_sweep_only_claims_uncapped_tokens() -> None:
@@ -309,7 +336,11 @@ def test_token_frontier_is_recursive_and_rationed() -> None:
     assert "solo" in got and "leveling" in got, got
     assert "1080p" not in got and "hindi" not in got and "x264" not in got, got
     assert m.stats["token_minted"] == len(got), m.stats
-    # pool leads (measured 4.17 new/search live vs 2.62 for the frontier)
+    # phrases minted alongside tokens, from the same recovered rows
+    assert "solo leveling" in list(m._phrase_frontier), list(m._phrase_frontier)
+    # seed lanes empty so the sweep lane is reached (it is last resort now)
+    m._seeds_for_block = (lambda blk, n=6, fresh_only=True: [])
+    # pool leads the frontier (measured 4.17 new/search live vs 2.62)
     m._token_pool = ["pooltoken"]
     m._token_ts = time.time()
     _, _, terms = m._next_terms(3, "a1")
@@ -317,6 +348,7 @@ def test_token_frontier_is_recursive_and_rationed() -> None:
     # ...and the frontier is the fallback that carries the sweep once it drains
     m._token_cursor = 0
     m._token_pool = []
+    m._phrase_pool = []
     m._token_ts = time.time()
     m.searched_terms.pop("solo", None)
     _, _, terms = m._next_terms(3, "a1")
@@ -334,6 +366,127 @@ def test_token_frontier_is_recursive_and_rationed() -> None:
     assert m3._claim_token() is None, "stale frontier token was served"
     print("PASS  token frontier: minted from recovered rows only, pool-first "
           "with frontier as the drain fallback, TTL-rationed")
+
+
+def test_save_is_atomic_and_corrupt_load_is_loud() -> None:
+    """A forced kill (the 2-hour recycle task) mid-dump used to leave half a
+    JSON; _load() swallowed it, so the miner forgot every term it had searched
+    and re-swept the pool for zero rows. save() must swap atomically, and a
+    bad file must be quarantined and reported, never silently ignored."""
+    import glob
+    import tempfile
+    m = make_miner()
+    tmpdir = tempfile.mkdtemp(prefix="idgap_state_")
+    m.state_path = os.path.join(tmpdir, "idgap_state.json")
+    del m.save  # make_miner stubs it; this test exercises the real atomic writer
+    m.done_blocks = {1, 2, 3}
+    m.searched_terms = {"alpha": 1.0, "beta": 2.0}
+    m.round_started = 0.0
+    m._phrase_cursor = 7
+    m._phrase_frontier = deque(["one two"], maxlen=500)
+    m.save()
+    assert not glob.glob(m.state_path + ".tmp"), "temp file left behind"
+    saved = json.load(open(m.state_path, encoding="utf-8"))
+    assert saved["searched_terms"] == {"alpha": 1.0, "beta": 2.0}, saved
+    assert saved["phrase_cursor"] == 7 and saved["phrase_frontier"] == ["one two"]
+
+    # a truncated file must be quarantined + reported, not swallowed
+    with open(m.state_path, "w", encoding="utf-8") as f:
+        f.write('{"searched_terms": {"alpha"')  # half a JSON
+    m2 = make_miner()
+    m2.state_path = m.state_path
+    m2._load()
+    assert m2.searched_terms == {}, "corrupt file was partially trusted"
+    quarantined = glob.glob(m.state_path + ".corrupt-*")
+    assert quarantined, "corrupt state not quarantined"
+    print("PASS  state save is atomic (tmp+replace); corrupt load is quarantined+reported")
+
+
+def test_phrase_channel_serves_when_token_pool_is_empty() -> None:
+    """The single-token pool is exhausted (174 left, mostly typo spam), so the
+    miner must fall through to two-word phrases -- and only clean, never-searched
+    phrases ranked by frequency."""
+    m = make_miner()
+    m._token_pool = []
+    m._token_ts = time.time()          # fresh: no token-pool rebuild
+    m._token_frontier = deque(["frontier token"], maxlen=500)
+    m._phrase_pool = ["alpha beta", "gamma delta", "seen phrase"]
+    m._phrase_ts = time.time()
+    m.searched_terms["seen phrase"] = time.time()   # already swept
+    m.coverage = lambda: {"coverage_pct": 44.6,
+                          "thin_blocks": [{"block": 2, "era_date": "2025-11-25"}]}
+    # seed lanes exist here and measure higher, so they take the pick first
+    blk, era, terms = m._next_terms(3, "a1")
+    assert terms and terms[0].startswith("seed:"), (
+        f"phrase pool stole a pick from a seed lane: {terms}")
+    # ...and with seed lanes empty the phrase pool serves, outranking frontiers
+    m._seeds_for_block = (lambda blk, n=6, fresh_only=True: [])
+    blk, era, terms = m._next_terms(3, "a1")
+    assert terms == ["tok:phrase-sweep:alpha beta"], terms
+    assert m.searched_terms["alpha beta"] > 0, "phrase not claimed"
+    # phrases outrank the frontiers: a full frontier must not starve a fresh pool
+    assert list(m._token_frontier) == ["frontier token"], \
+        "token frontier was drained before the fresh phrase pool"
+    # never re-serves a phrase already in the TTL window
+    m2 = make_miner()
+    m2._token_pool = []
+    m2._token_ts = time.time()
+    m2._phrase_pool = ["alpha beta"]
+    m2._phrase_ts = time.time()
+    m2.searched_terms["alpha beta"] = time.time()
+    assert m2._claim_token() is None, "claimed a phrase inside its TTL"
+    # phrase hits keep minting fresh phrases (recursive supply)
+    m3 = make_miner()
+    m3._drain_token_hits([{"title": "Solo Leveling S02E13 1080p Hindi WEB-DL x264"}])
+    minted = list(m3._phrase_frontier)
+    assert "solo leveling" in minted, minted
+    assert not any("1080p" in p for p in minted), minted
+    print("PASS  phrase channel: falls through when token pool is dry, TTL-respects "
+          "claims, and mints phrases from recovered rows")
+
+
+def test_slice_channel_claims_each_slice_once() -> None:
+    """The season-slice lane must claim each slice exactly once and never
+    re-serve a slice inside its TTL -- two agents must not pick the same
+    slice, and the kind must survive step() into term_stats/[alive]."""
+    m = make_miner()
+    m._seeds_for_block = (lambda blk, n=6, fresh_only=True: [])
+    m._slice_pool = [("show s02", "slice-season"), ("show s03", "slice-season"),
+                     ("show s02e01", "slice-ep")]
+    blk, era, terms = m._next_terms(3, "a1")
+    assert terms == ["slc:slice-season:show s02"], terms
+    assert m.searched_terms.get("show s02", 0) > 0, "slice not claimed"
+    _, _, terms2 = m._next_terms(3, "a2")
+    assert terms2 == ["slc:slice-season:show s03"], terms2
+    assert terms != terms2, "two agents claimed the same slice"
+    # kind survives the round trip through step()
+    m.client = SimpleNamespace(search=lambda term: {"results": [
+        {"id": 60_001, "title": "Show S02E01 1080p", "created_at": "2026-01-01"}]})
+    m.index = SimpleNamespace(upsert=lambda rows, source: (1, 0))
+    info = m.step("a1")
+    assert info["kind"] == "slice-ep", info
+    assert info["term"] == "show s02e01", info
+    assert m.term_stats["slice-ep"]["tries"] == 1, m.term_stats
+    # inside the TTL a slice is never re-served, even with the cursor rewound
+    m2 = make_miner()
+    m2._seeds_for_block = (lambda blk, n=6, fresh_only=True: [])
+    m2._slice_pool = [("show s02", "slice-season")]
+    m2.searched_terms["show s02"] = time.time()
+    assert m2._claim_slice() is None, "re-served a slice inside its TTL"
+    # the self-feed queue mints facet sub-slices from capped results, bounded
+    m3 = make_miner()
+    rows = [{"id": 1, "title": "Show S02E01 1080p"}] * 50
+    m3._drain_slice_hits(rows, "show s02")
+    q = list(m3._slice_queue)
+    assert q and all(k == "slice-season" for _, k in q), q
+    assert len(q) <= 500, q
+    assert m3.stats["slice_minted"] == len(q), m3.stats
+    # ...and a non-capped result with no new seasons mints nothing
+    m4 = make_miner()
+    m4._drain_slice_hits([{"id": 1, "title": "Show S02E01 1080p"}], "show s02")
+    assert list(m4._slice_queue) == [], list(m4._slice_queue)
+    print("PASS  slice channel: each slice claimed exactly once, TTL-respected, "
+          "kind survives step(), capped results self-feed facet sub-slices")
 
 
 def test_nat64_resolver_guard() -> None:
@@ -380,9 +533,12 @@ if __name__ == "__main__":
     test_priority_still_beats_a_fresh_low_priority_waiter()
     test_priority_backlog_cannot_shadow_the_probe_lanes()
     test_capped_letter_expansion_keeps_the_prefix_space()
-    test_token_sweep_is_served_and_never_duplicates()
+    test_token_sweep_never_duplicates_and_yields_to_seed_lanes()
     test_token_sweep_only_claims_uncapped_tokens()
     test_token_frontier_is_recursive_and_rationed()
+    test_save_is_atomic_and_corrupt_load_is_loud()
+    test_phrase_channel_serves_when_token_pool_is_empty()
+    test_slice_channel_claims_each_slice_once()
     test_nat64_resolver_guard()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()

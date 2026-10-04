@@ -385,8 +385,16 @@ class Discovery:
                 self.lanes[src] = stay
                 self.lanes["priority"] = move + self.lanes["priority"]
             self.queued_set = set(self.queued)
-        except Exception:
+        except FileNotFoundError:
             pass
+        except Exception as e:
+            try:
+                bad = f"{self.state_path}.corrupt-{int(time.time())}"
+                os.replace(self.state_path, bad)
+                print(f"[discovery] state file unreadable ({type(e).__name__}: "
+                      f"{e}); quarantined to {bad}", flush=True)
+            except Exception:
+                pass
         if not self.queued_set and not self.done_terms:
             self._seed_backfill()
 
@@ -409,8 +417,12 @@ class Discovery:
                         "year_crawl_version": _YEAR_CRAWL_VERSION,
                         "ts": time.time(),
                     }
-                with open(self.state_path, "w", encoding="utf-8") as f:
+                with open(f"{self.state_path}.tmp", "w", encoding="utf-8") as f:
                     json.dump(payload, f)
+                # Atomic swap: a forced kill mid-dump used to leave half a JSON,
+                # which _load() swallowed -- silently wiping every lane and the
+                # known-term memory of a 24k-term crawler.
+                os.replace(f"{self.state_path}.tmp", self.state_path)
             except Exception:
                 pass
 

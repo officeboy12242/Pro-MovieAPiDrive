@@ -65,6 +65,22 @@ _SPILL_REACTION = ("esub", "1080p", "hindi", "720p", "mkv", "zip", "s01")
 # UNSEARCHED sub-50 slice — the season axis, like facets on the quality axis.
 _EP_SUFFIXES = tuple([f"s{n:02d}" for n in range(1, 8)]
                      + [f"e{n:02d}" for n in range(1, 13)])
+# Season-slice channel (the successor to token/phrase sweeps, both measured
+# dry: tokens 174 eligible left, phrases 0.00 new/search). Any query generated
+# FROM our own titles is exhausted, because this vault was itself built by
+# sweeping those titles. What still pays is a NEW query shape over titles we
+# hold: OTHER seasons / episode numbers / season+facet slices of the same
+# show. Measured live 2026-10-04: 'prison break s02'-style other-season
+# slices 2.38 new/search (re-measured 2026-10-04 at 3.11 over 18 probes);
+# probing past a show's held range ('simpsons s37')
+# returns 0 rows (nothing to surface), and bare 'show sXXeYY' episode probes
+# mostly return 0 rows (the site lacks those uploads), so season slices lead
+# and episode slices are the bounded tail of the pool.
+_SLICE_POOL_CAP = 20000     # bounded pool: season slices first, episodes fill
+_SLICE_SEASON_CAP = 16000   # ...of which at most this many are season slices
+_SLICE_QUEUE_CAP = 500      # bounded self-feed queue (mirrors _spill_queue)
+_SLICE_SEASON_HI = 40       # per-show season expansion bound (junk guard)
+_SLICE_EP_HI = 12           # per-season episode expansion bound
 import re as _re
 
 _HEAD_WORD = _re.compile(r"[a-z0-9]+")
@@ -73,6 +89,9 @@ _SERIES_MARK = _re.compile(r"\b(?:s\d{1,2}\s*e?\s*\d{0,3}|season\s*\d{1,2})", _r
 _NOISE = _re.compile(
     r"gdflix|hubcloud|hdrip|camrip|dvdscr|www\.|\.com|\.in\b|downloaded",
     _re.I)
+# Junk head filter for the season-slice pool: HTML-entity fragments and
+# site-tag prefixes that slipped into canonical heads ('grey 039 s anatomy').
+_SLICE_JUNK = _re.compile(r"039|titancloud|gdflix|^www\.|\.com\b", _re.I)
 
 # ---------------------------------------------------------------------------
 # Token sweep: the one lever that reaches ids OLDER than the newest-50 window.
@@ -99,6 +118,17 @@ _TOKEN_MAX_LEN = 24
 _TOKEN_POOL_TTL = 6 * 3600
 _FRONTIER_CAP = 500     # bounded queue of tokens found only in recovered rows
 _TOKEN_SPLIT = _re.compile(r"[^a-z0-9]+")
+# Phrase sweep (the successor channel). The single-token pool is measured
+# exhausted: after 29,187 tokens searched there are 174 eligible left, most of
+# them typo spam ('crspskmhd', 'e026'). Adjacent pairs of RARE words are the
+# next space: a phrase of two rare words matches few rows, and a query matching
+# <= 50 rows returns its COMPLETE match set -- the only complete-enumeration
+# primitive this site offers. Built client-side: grouping ~2.6M pairs server
+# side exceeds the Atlas 100MB $group limit and allowDiskUse is refused here.
+_PHRASE_TTL = 6 * 3600
+_PHRASE_CAP = 20000       # bounded phrase pool
+_PHRASE_FRONTIER_CAP = 500
+_PHRASE_WORD = _re.compile(r"^[a-z0-9]{4,}$")
 # Very common English words match far more than 50 rows on the site, so they
 # can never surface an unseen row -- and the frontier mints them constantly
 # (measured live: 'you' and 'know' both returned 50 rows / 0 new). They are
@@ -202,6 +232,12 @@ class IdGapMiner:
     _token_cursor = 0
     _token_pick = 0
     _token_frontier: deque = deque(maxlen=_FRONTIER_CAP)
+    # Season-slice channel defaults (see __init__ for the live values).
+    slice_batch = 400
+    _slice_pool: list = []
+    _slice_ts = 0.0
+    _slice_cursor = 0
+    _slice_queue: deque = deque(maxlen=_SLICE_QUEUE_CAP)
 
     def __init__(self, client: MkvbaseClient, index, state_dir: str):
         self.client = client
@@ -252,6 +288,23 @@ class IdGapMiner:
         self._token_cursor = 0
         self._token_pick = 0
         self._token_frontier = deque(maxlen=_FRONTIER_CAP)
+        # Phrase sweep state. _phrase_pool is filled by a background thread so
+        # no search ever waits on the 35s build.
+        self._phrase_pool: list[str] = []
+        self._phrase_ts = 0.0
+        self._phrase_cursor = 0
+        self._phrase_ttl = float(os.getenv("MKV_IDGAP_PHRASE_TTL_S", str(_PHRASE_TTL)))
+        self.phrase_batch = max(10, int(os.getenv("MKV_IDGAP_PHRASE_BATCH", "400")))
+        self._phrase_frontier: deque = deque(maxlen=_PHRASE_FRONTIER_CAP)
+        # Season-slice channel state. _slice_pool is [(term, kind)] built by a
+        # background thread (full vault scan, ~1min); _slice_queue is the
+        # self-feed: facet-on-season + newly seen seasons minted from capped
+        # slice results, mirroring the _spill_queue/cap-spill pattern.
+        self._slice_pool: list[tuple[str, str]] = []
+        self._slice_ts = 0.0
+        self._slice_cursor = 0
+        self.slice_batch = max(10, int(os.getenv("MKV_IDGAP_SLICE_BATCH", "400")))
+        self._slice_queue: deque = deque(maxlen=_SLICE_QUEUE_CAP)
 
     # ------------------------------------------------------------ state
     def _load(self) -> None:
@@ -267,21 +320,52 @@ class IdGapMiner:
             self._token_cursor = int(d.get("token_cursor") or 0)
             self._token_frontier = deque(d.get("token_frontier") or [],
                                          maxlen=_FRONTIER_CAP)
-        except Exception:
+            self._phrase_cursor = int(d.get("phrase_cursor") or 0)
+            self._phrase_frontier = deque(d.get("phrase_frontier") or [],
+                                          maxlen=_PHRASE_FRONTIER_CAP)
+            self._slice_cursor = int(d.get("slice_cursor") or 0)
+            self._slice_queue = deque(
+                [(t, k) for t, k in (d.get("slice_queue") or []) if t and k],
+                maxlen=_SLICE_QUEUE_CAP)
+        except FileNotFoundError:
             pass
+        except Exception as e:
+            # A half-written state file used to be swallowed here, so after any
+            # forced kill (the 2-hour recycle task) the miner silently forgot
+            # every term it had ever searched and re-swept the whole pool for
+            # zero rows -- measured 0.02 new rows/search vs 2.2 before the wipe.
+            # Quarantine the bad file and say so instead.
+            try:
+                bad = f"{self.state_path}.corrupt-{int(time.time())}"
+                os.replace(self.state_path, bad)
+                print(f"[idgap] state file unreadable ({type(e).__name__}: {e}); "
+                      f"quarantined to {bad} and starting with an empty history",
+                      flush=True)
+            except Exception:
+                pass
 
     def save(self) -> None:
         with self._lock:
             try:
                 os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
-                with open(self.state_path, "w", encoding="utf-8") as f:
-                    json.dump({"done_blocks": sorted(self.done_blocks)[-500:],
-                               "searched_terms": self.searched_terms,
-                               "term_stats": self.term_stats,
-                               "round_started": self.round_started,
-                               "stats": self.stats,
-                               "token_cursor": self._token_cursor,
-                               "token_frontier": list(self._token_frontier)}, f)
+                payload = {"done_blocks": sorted(self.done_blocks)[-500:],
+                           "searched_terms": self.searched_terms,
+                           "term_stats": self.term_stats,
+                           "round_started": self.round_started,
+                           "stats": self.stats,
+                           "token_cursor": self._token_cursor,
+                           "token_frontier": list(self._token_frontier),
+                           "phrase_cursor": self._phrase_cursor,
+                           "phrase_frontier": list(self._phrase_frontier),
+                           "slice_cursor": self._slice_cursor,
+                           "slice_queue": list(self._slice_queue)}
+                # Atomic: dump to a sibling temp file, then swap. A kill during
+                # the dump used to leave half a JSON that _load() could not
+                # read -- i.e. a silent wipe of the whole search history.
+                tmp = f"{self.state_path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+                os.replace(tmp, self.state_path)
             except Exception:
                 pass
 
@@ -505,14 +589,92 @@ class IdGapMiner:
         self._token_ts = now
         return fresh
 
-    def _claim_token(self) -> tuple[str, str] | None:
-        """Claim one sweep token: (term, kind) or None when both lanes are dry.
+    # ------------------------------------------------------------ phrase sweep
+    def _build_phrase_pool(self) -> int:
+        """Rebuild the phrase pool from the vault. Returns phrases kept.
 
-        Pool first: measured 4.17 new rows/search live vs 2.62 for the frontier,
-        and it holds ~23k tokens, so it is the budget for the next day or so.
-        Frontier second, as the fallback that carries the sweep once the pool is
-        exhausted -- its tokens were minted from rows the sweep itself recovered,
-        so they are queries the vault could not have generated any other way.
+        Two streaming passes, no server-side $group: pass 1 counts clean word
+        frequencies, pass 2 counts adjacent pairs of RARE words (2..50 rows).
+        A pair past 50 is frozen -- it can no longer be a complete
+        enumeration, and freezing keeps the counter small. Measured: 330k rows
+        per pass in ~35s -> ~11k phrases.
+
+        The word count is done client-side on purpose. The equivalent $group
+        timed out (20s socketTimeout) on the Atlas shard when the per-pick
+        coverage query was running alongside it; two cursor passes never exceed
+        a per-batch socket timeout.
+        """
+        idx = getattr(self, "index", None)
+        if idx is None:
+            return 0
+        cols = [c for c in getattr(idx, "cols", lambda: [])() if c is not None]
+        if not cols:
+            return 0
+
+        def _scan(rare: set[str] | None = None):
+            """Yield adjacent clean-word pairs (filtered by `rare` if given)."""
+            for c in cols:
+                for r in c.find({"title_tokens": {"$exists": True}},
+                                {"title_tokens": 1, "_id": 0}).batch_size(2000):
+                    seq = [w for w in (r.get("title_tokens") or [])
+                           if isinstance(w, str) and _PHRASE_WORD.match(w)]
+                    if rare is not None:
+                        seq = [w for w in seq if w in rare]
+                    for a, b in zip(seq, seq[1:]):
+                        yield a + " " + b
+
+        freq: Counter = Counter()
+        for w in (p.split(" ", 1)[0] for p in _scan()):
+            freq[w] += 1
+        rare = {w for w, n in freq.items()
+                if _TOKEN_MIN_FREQ <= n <= _TOKEN_MAX_FREQ
+                and w not in _TOKEN_STOP}
+        pairs: Counter = Counter()
+        for p in _scan(rare):
+            if pairs.get(p, 0) >= _TOKEN_MAX_FREQ:
+                continue
+            pairs[p] += 1
+        with self._lock:
+            searched = self.searched_terms
+        fresh = [p for p, n in pairs.items()
+                 if n >= _TOKEN_MIN_FREQ and p not in searched]
+        fresh.sort(key=lambda p: -pairs[p])
+        fresh = fresh[:_PHRASE_CAP]
+        self._phrase_pool = fresh
+        self._phrase_ts = time.time()
+        return len(fresh)
+
+    def _start_phrase_builder(self, log=print) -> None:
+        """Build the phrase pool off-thread (~70s) and refresh it every TTL."""
+        def _loop() -> None:
+            time.sleep(20.0)  # let the first picks settle: the shard is busiest
+            #                          right after startup and coverage() is running
+            while True:
+                t0 = time.time()
+                try:
+                    n = self._build_phrase_pool()
+                    log(f"[idgap] phrase pool: {n} two-word phrases ready "
+                        f"({time.time() - t0:.0f}s)", flush=True)
+                    time.sleep(max(600.0, self._phrase_ttl / 2))
+                except Exception as e:
+                    log(f"[idgap] phrase pool build failed: {type(e).__name__}: "
+                        f"{str(e)[:120]}", flush=True)
+                    time.sleep(120.0)  # transient shard contention: retry soon
+        threading.Thread(target=_loop, daemon=True, name="idgap-phrase").start()
+
+    def _claim_token(self) -> tuple[str, str] | None:
+        """Claim one sweep term: (term, kind) or None when every lane is dry.
+
+        Order is measured supply, not history. The single-token pool is measured
+        exhausted (174 eligible left, mostly typo spam), so the phrase pool --
+        12k fresh two-word keys -- outranks both frontiers. Serving it before
+        the frontiers matters: the token frontier holds up to 500 minted keys
+        and measures ~0.19 new rows/search, which at 22 searches/min would
+        starve a 12k pool for the better part of a day.
+
+        Token pool, then phrase pool, then the two frontiers last. The phrase
+        pool is built by its own thread and only read here, so a search never
+        pays for the build.
         """
         now = time.time()
         with self._lock:
@@ -528,6 +690,17 @@ class IdGapMiner:
                         self._token_cursor = i + 1
                         self.searched_terms[t] = now
                         return t, "token-sweep"
+        phrases = self._phrase_pool
+        if phrases:
+            with self._lock:
+                n2 = len(phrases)
+                for i in range(self._phrase_cursor,
+                               self._phrase_cursor + self.phrase_batch):
+                    p = phrases[i % n2]
+                    if now - self.searched_terms.get(p, 0.0) > self.term_ttl_s:
+                        self._phrase_cursor = i + 1
+                        self.searched_terms[p] = now
+                        return p, "phrase-sweep"
         with self._lock:
             while self._token_frontier:
                 t = self._token_frontier.popleft()
@@ -535,6 +708,13 @@ class IdGapMiner:
                     continue  # raced or already done
                 self.searched_terms[t] = now
                 return t, "token-frontier"
+        with self._lock:
+            while self._phrase_frontier:
+                p = self._phrase_frontier.popleft()
+                if now - self.searched_terms.get(p, 0.0) <= self.term_ttl_s:
+                    continue
+                self.searched_terms[p] = now
+                return p, "phrase-frontier"
         return None
 
     def _drain_token_hits(self, rows: list[dict]) -> None:
@@ -545,9 +725,11 @@ class IdGapMiner:
         check happens at pop time.
         """
         minted = 0
+        minted_phrases = 0
         with self._lock:
             for r in rows:
-                for t in _terms_of(r.get("title") or ""):
+                terms = _terms_of(r.get("title") or "")
+                for t in terms:
                     if (t in _TOKEN_STOP or t in _TOKEN_COMMON
                             or t in self.searched_terms
                             or len(self._token_frontier) >= _FRONTIER_CAP):
@@ -555,8 +737,189 @@ class IdGapMiner:
                     if _TOKEN_MIN_LEN <= len(t) <= _TOKEN_MAX_LEN:
                         self._token_frontier.append(t)
                         minted += 1
+                # ...and their adjacent pairs, so a recovered row feeds the
+                # phrase channel too and the sweep keeps generating its own
+                # supply even after the static phrase pool is used up.
+                seq = [t for t in terms
+                       if _PHRASE_WORD.match(t) and t not in _TOKEN_STOP]
+                for a, b in zip(seq, seq[1:]):
+                    p = a + " " + b
+                    if p in self.searched_terms:
+                        continue
+                    if len(self._phrase_frontier) >= _PHRASE_FRONTIER_CAP:
+                        break
+                    self._phrase_frontier.append(p)
+                    minted_phrases += 1
         if minted:
             self.stats["token_minted"] = self.stats.get("token_minted", 0) + minted
+        if minted_phrases:
+            self.stats["phrase_minted"] = (
+                self.stats.get("phrase_minted", 0) + minted_phrases)
+
+    # ------------------------------------------------------------ season-slice channel
+    def _build_slice_pool(self) -> int:
+        """Expand every vaulted series head across its seasons + a bounded
+        episode range. Returns slices kept.
+
+        One streaming pass over titles: heads come from the same series-head
+        path (_series_heads normalisation) with per-season expansion via
+        discovery's _seasons_in/_episodes_in. A bare head search returns only
+        the site's NEWEST 50 matches, but 'show s02' is a DIFFERENT query
+        whose <=50 match set (or newest-50 window over a smaller set) reaches
+        rows the bare head can never surface. Season slices lead the pool
+        (measured 3.11 new/search); episode slices are the bounded tail.
+        Single-season shows first: their other seasons are the proven shape.
+        """
+        from .discovery import (_canonical_show, _episodes_in, _seasons_in,
+                                _title_head as _show_head)
+        idx = getattr(self, "index", None)
+        if idx is None:
+            return 0
+        cols = [c for c in getattr(idx, "cols", lambda: [])() if c is not None]
+        if not cols:
+            return 0
+        shows: dict[str, set[int]] = {}
+        epmax: dict[tuple[str, int], int] = {}
+        for c in cols:
+            cur = c.find({"title": {"$type": "string"}},
+                         {"title": 1, "_id": 0}).batch_size(2000)
+            for r in cur:
+                t = r.get("title") or ""
+                if not _SERIES_MARK.search(t):
+                    continue
+                h = _show_head(t)
+                if not h:
+                    continue
+                h = _canonical_show(h)
+                if not h or len(h) < 4 or _SLICE_JUNK.search(h):
+                    continue
+                shows.setdefault(h, set()).update(_seasons_in(t))
+                for sn, ep in _episodes_in(t):
+                    if 1 <= ep <= 60:
+                        k = (h, sn)
+                        if ep > epmax.get(k, 0):
+                            epmax[k] = ep
+        with self._lock:
+            searched = self.searched_terms
+        multi: list[tuple[str, str]] = []   # >=2 held seasons: proven catalog depth
+        single: list[tuple[str, str]] = []  # 1 held season: s01 first (scam-1992 shape)
+        eps: list[tuple[str, str]] = []
+        for h in sorted(shows):
+            ss = shows[h]
+            if not ss:
+                continue
+            # Single-season shows: seasons past max+1 are proven barren
+            # ('simpsons s37'-style probes: 0 rows), and the padded s04-s06
+            # range burns searches for nothing. Keep max+1 plus one pad.
+            if len(ss) >= 2:
+                hi = min(max(max(ss), 5) + 1, _SLICE_SEASON_HI)
+            else:
+                hi = min(max(ss) + 2, 4)
+            dest = multi if len(ss) >= 2 else single
+            for s in range(1, hi + 1):
+                t = f"{h} s{s:02d}"
+                if t not in searched:
+                    dest.append((t, "slice-season"))
+        # s01 of every single-season show outranks their s05: lower seasons
+        # exist more often, and unsearched s01 slices measured 16 new/search.
+        single.sort(key=lambda tk: (int(tk[0].rsplit(" ", 1)[-1][1:]), tk[0]))
+        season = multi + single
+        for h in sorted(shows, key=lambda h: (-len(shows[h]), h)):
+            for s in sorted(shows[h]):
+                top = min(max(epmax.get((h, s), 6), 6), _SLICE_EP_HI)
+                for e in range(1, top + 1):
+                    t = f"{h} s{s:02d}e{e:02d}"
+                    if t not in searched:
+                        eps.append((t, "slice-ep"))
+        kept_season = season[:_SLICE_SEASON_CAP]
+        kept_eps = eps[:max(0, _SLICE_POOL_CAP - len(kept_season))]
+        self._slice_pool = kept_season + kept_eps
+        self._slice_ts = time.time()
+        return len(self._slice_pool)
+
+    def _start_slice_builder(self, log=print) -> None:
+        """Build the slice pool off-thread and refresh it every TTL."""
+        def _loop() -> None:
+            time.sleep(10.0)  # coverage() owns the shard right after startup
+            while True:
+                t0 = time.time()
+                try:
+                    n = self._build_slice_pool()
+                    log(f"[idgap] slice pool: {n} season/episode slices ready "
+                        f"({time.time() - t0:.0f}s)", flush=True)
+                    time.sleep(max(900.0, self.term_ttl_s / 2))
+                except Exception as e:
+                    log(f"[idgap] slice pool build failed: {type(e).__name__}: "
+                        f"{str(e)[:120]}", flush=True)
+                    time.sleep(120.0)
+        threading.Thread(target=_loop, daemon=True, name="idgap-slice").start()
+
+    def _claim_slice(self) -> tuple[str, str] | None:
+        """Claim one season/episode slice: (term, kind) or None when dry.
+
+        Pool first (cursor + TTL claim, so two agents never take the same
+        slice), then the self-feed queue minted from capped slice results.
+        """
+        now = time.time()
+        pool = self._slice_pool
+        if pool:
+            with self._lock:
+                n = len(pool)
+                for i in range(self._slice_cursor,
+                               self._slice_cursor + self.slice_batch):
+                    term, kind = pool[i % n]
+                    if now - self.searched_terms.get(term, 0.0) > self.term_ttl_s:
+                        self._slice_cursor = i + 1
+                        self.searched_terms[term] = now
+                        return term, kind
+        with self._lock:
+            while self._slice_queue:
+                term, kind = self._slice_queue.popleft()
+                if now - self.searched_terms.get(term, 0.0) <= self.term_ttl_s:
+                    continue  # raced or already done
+                self.searched_terms[term] = now
+                return term, kind
+        return None
+
+    def _drain_slice_hits(self, rows: list[dict], term: str) -> None:
+        """Feed the slice channel from its own results (bounded queue).
+
+        A capped season slice proves older rows exist below the 50-window:
+        mint its facet sub-slices. Rows naming seasons the pool never
+        expanded to become new season slices. TTL-dedup happens at pop time.
+        """
+        from .discovery import _seasons_in
+        minted = 0
+        with self._lock:
+            if len(rows) >= 50:
+                base = term
+                for f in _SPILL_REACTION:
+                    t2 = f"{base} {f}"
+                    if t2 == term or t2 in self.searched_terms:
+                        continue
+                    if any(t == t2 for t, _ in self._slice_queue):
+                        continue
+                    if len(self._slice_queue) >= _SLICE_QUEUE_CAP:
+                        break
+                    self._slice_queue.append((t2, "slice-season"))
+                    minted += 1
+            head = term.rsplit(" ", 1)[0] if " " in term else term
+            if _re.fullmatch(r"s\d{2}", term.rsplit(" ", 1)[-1] or ""):
+                seen: set[int] = set()
+                for r in rows:
+                    seen.update(_seasons_in(r.get("title") or ""))
+                for s in sorted(seen):
+                    t2 = f"{head} s{s:02d}"
+                    if t2 == term or t2 in self.searched_terms:
+                        continue
+                    if any(t == t2 for t, _ in self._slice_queue):
+                        continue
+                    if len(self._slice_queue) >= _SLICE_QUEUE_CAP:
+                        break
+                    self._slice_queue.append((t2, "slice-season"))
+                    minted += 1
+        if minted:
+            self.stats["slice_minted"] = self.stats.get("slice_minted", 0) + minted
 
     def _next_terms(self, n: int, agent: str = "a1") -> tuple[int | None, str, list[str]]:
         cov = self.coverage()
@@ -571,18 +934,18 @@ class IdGapMiner:
             self._pick += 1
             allow_spill = (self._pick % self.spill_every == 0)
             allow_token = (self._pick % self.token_every == 0)
-        # TOKEN SWEEP FIRST. Measured on the live site: 7.1-10.0 NEW rows per
-        # search (0% duplicate share, every row an interior id) against
-        # 0.02-0.27 for every lane below. It is gated rather than unconditional
-        # so the thin-block lanes keep running, but it earns the pick whenever
-        # its gate opens and it still has unsearched tokens.
-        if allow_token:
-            got = self._claim_token()
-            if got:
-                term, kind = got
-                self.stats["picked_block"] = None
-                self.stats["picked_era"] = "token-sweep"
-                return None, "token-sweep", [f"tok:{kind}:{term}"]
+        # TOKEN/PHRASE SWEEP -- LAST RESORT, not first (measured 2026-10-04).
+        # The sweep used to earn every pick at 7-10 new rows/search while the
+        # pools were fresh. Both are now measured dry: 29,187 tokens searched,
+        # 174 eligible left, and the 12k two-word phrase pool measures 0.00
+        # new/search -- verified against the site directly (20 live queries,
+        # every returned id already in the vault). That is structural, not
+        # bad luck: the sweep queries are built FROM our own titles, and this
+        # vault was itself built by sweeping those titles, so anything they
+        # can generate we already hold. What still pays is a NEW query shape
+        # over titles we hold -- other seasons (2.38), seed-spill (3.71),
+        # seed-ep (2.75). So the sweep only takes a pick when the seed lanes
+        # have nothing left.
         # CAP-SPILL REACTION: slices queued when a search hit the 50-row site
         # cap. Rationed -- see self.spill_every.
         if allow_spill:
@@ -596,6 +959,17 @@ class IdGapMiner:
                     self.searched_terms[term] = now
                     self.stats["picked_block"] = self.stats.get("picked_block")
                     return None, "", [f"seed:{term}"]
+        # SEASON-SLICE CHANNEL. Other seasons / episode numbers / season+facet
+        # slices of vaulted series heads. Measured live 2026-10-04 at 3.11 new
+        # rows/search over 18 unsearched probes (vs 0.00 for phrases, 0.04 for
+        # leftover tokens): this is the only lane whose query SHAPE is new, so
+        # it earns the pick whenever it has an unsearched slice.
+        got_slice = self._claim_slice()
+        if got_slice:
+            term, kind = got_slice
+            self.stats["picked_block"] = None
+            self.stats["picked_era"] = kind
+            return None, kind, [f"slc:{kind}:{term}"]
         # FRESH-HEAD SWEEP first: heads of the newest vault pushes (20-min
         # cache). Bare head catches uploads since the vault push; head+top-
         # facet catches that head's pre-push siblings ranked below the cap.
@@ -646,6 +1020,15 @@ class IdGapMiner:
                     self.stats["picked_block"] = blk * self.block
                     self.stats["picked_era"] = era
                     return blk, era, [f"seed:{term}"]
+        # TOKEN/PHRASE SWEEP, last resort (see the note where it used to run):
+        # only reached when every seed lane is exhausted for this pick.
+        if allow_token:
+            got = self._claim_token()
+            if got:
+                term, kind = got
+                self.stats["picked_block"] = None
+                self.stats["picked_era"] = kind
+                return None, kind, [f"tok:{kind}:{term}"]
         # LRU valve: every slice in the 5 thinnest blocks is burned. Re-search
         # the block whose freshest head is the OLDEST (most stale block), one
         # bare head per call — new sibling uploads since the last try are the
@@ -693,9 +1076,10 @@ class IdGapMiner:
             return {"status": "idle", "agent": agent}
         raw = terms[0]
         forced_kind = None
-        if raw.startswith("tok:"):
-            # 'tok:<kind>:<term>' -- the kind is carried explicitly so a bare
-            # token is not mislabelled 'seed-head' by _term_kind().
+        if raw.startswith(("tok:", "slc:")):
+            # 'tok:<kind>:<term>' / 'slc:<kind>:<term>' -- the kind is carried
+            # explicitly so a slice is not mislabelled 'seed-head' by
+            # _term_kind().
             _, forced_kind, term = raw.split(":", 2)
         elif raw.startswith("seed:"):
             term = raw[5:]
@@ -714,10 +1098,14 @@ class IdGapMiner:
                     "err": f"{type(e).__name__}: {str(e)[:100]}"}
         rows = [r for r in (obj.get("results") or []) if isinstance(r, dict)]
         new, _upd = self.index.upsert(rows, source=f"idgap:{agent}:b{blk}")
-        if kind.startswith("token-"):
+        if kind.startswith(("token-", "phrase-")):
             # Rows the sweep just recovered carry tokens the vault has never
             # held -- free, self-generated search keys for the next pass.
             self._drain_token_hits(rows)
+        if kind.startswith("slice-"):
+            # Capped slice results mint their own facet sub-slices, so the
+            # channel feeds itself below the 50-row window.
+            self._drain_slice_hits(rows, term)
         in_block = sum(1 for r in rows
                        if blk is not None and blk * self.block <= (r.get("id") or 0)
                        < (blk + 1) * self.block)
@@ -749,6 +1137,8 @@ class IdGapMiner:
 
     def run(self, log=print, stop: threading.Event | None = None) -> None:
         stop = stop or threading.Event()
+        self._start_phrase_builder(log)
+        self._start_slice_builder(log)
 
         def agent_loop(idx: int) -> None:
             agent = f"a{idx}"
