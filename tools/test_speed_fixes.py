@@ -108,7 +108,11 @@ def test_cap_spill_is_rationed() -> None:
     # every reaction facet except the slice we just searched
     assert list(m._spill_queue) == [f"solo head {f}" for f in _SPILL_REACTION
                                     if f != "720p"], list(m._spill_queue)
-    assert "solo head esub" in m._spill_queue and "solo head s01" in m._spill_queue
+    # 's01' is deliberately NOT a reaction facet: appending it to a season
+    # slice mints 'show s01 s01', which caps and chains to 'show s01 s01 s01'
+    # (measured 2026-10-05: 475 slice tries, 0 new, vault frozen 15 min).
+    assert "solo head esub" in m._spill_queue and "solo head mkv" in m._spill_queue
+    assert "solo head s01" not in m._spill_queue, "s01 must not be a reaction facet"
     # 2) Phase 1: cap-spill is the lowest-yield lane (0.10 new rows/search vs
     #    seed-head 0.50), so it must be rationed to 1-in-N picks. If it still
     #    wins every pick the fleet spends all its supply on the weakest lane.
@@ -487,6 +491,32 @@ def test_slice_channel_claims_each_slice_once() -> None:
     assert list(m4._slice_queue) == [], list(m4._slice_queue)
     print("PASS  slice channel: each slice claimed exactly once, TTL-respected, "
           "kind survives step(), capped results self-feed facet sub-slices")
+
+
+def test_slice_selffeed_no_degenerate_chains() -> None:
+    """A capped slice must never mint 'show s02 s02' style chains.
+
+    _SPILL_REACTION used to contain 's01', so 'show s01' capped and minted
+    'show s01 s01', which capped and minted 'show s01 s01 s01' -- degenerate
+    queries returning 0 new. Measured 2026-10-05: 475 slice tries, 0 new
+    rows, vault frozen for 15 min. The reaction tuple drops 's01' and the
+    mint skips any facet already a suffix of the term.
+    """
+    m = make_miner()
+    rows = [{"id": i, "title": f"Show S02E01 1080p"} for i in range(50)]
+    m._drain_slice_hits(rows, "show s02")
+    q = [t for t, _ in m._slice_queue]
+    assert q, "capped slice must self-feed facet sub-slices"
+    for t in q:
+        parts = t.split(" ")
+        assert len(parts) == len(set(parts)), f"repeated facet in slice term: {t}"
+        assert "s02 s02" not in t, f"degenerate season chain minted: {t}"
+    # a facet sub-slice that caps must not chain either
+    m2 = make_miner()
+    m2._drain_slice_hits(rows, "show s02 mkv")
+    for t, _ in m2._slice_queue:
+        assert "mkv mkv" not in t and "s02 s02" not in t, f"chain: {t}"
+    print("PASS  slice self-feed: no degenerate facet/season chains minted")
 
 
 def test_nat64_resolver_guard() -> None:

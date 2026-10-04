@@ -60,7 +60,7 @@ _SPILL_EXTRAS = ("zip", "s01", "e01", "hindi", "mkv", "tamil")
 # The cap-spill reaction fires when a search returns the full 50 rows, which
 # proves the head is hot. Queue that head's best-yielding slices, not just
 # the first N of the rotation.
-_SPILL_REACTION = ("esub", "1080p", "hindi", "720p", "mkv", "zip", "s01")
+_SPILL_REACTION = ("esub", "1080p", "hindi", "720p", "mkv", "zip")
 # Episode fanout: every other season/episode of a vaulted series is an
 # UNSEARCHED sub-50 slice — the season axis, like facets on the quality axis.
 _EP_SUFFIXES = tuple([f"s{n:02d}" for n in range(1, 8)]
@@ -859,6 +859,14 @@ class IdGapMiner:
 
         Pool first (cursor + TTL claim, so two agents never take the same
         slice), then the self-feed queue minted from capped slice results.
+
+        NOTE: the queue must stay SECOND. _SPILL_REACTION contains 's01',
+        so a capped slice mints 'show s01 s01', which caps and mints
+        'show s01 s01 s01' -- a degenerate chain that returns 0 new.
+        Draining the queue first was measured on 2026-10-05: 475 slice
+        tries, 0 new rows, vault frozen for 15 min. Pool-first is the
+        known-good order; the queue is only a fallback when the pool's
+        local batch is TTL-locked.
         """
         now = time.time()
         pool = self._slice_pool
@@ -894,6 +902,8 @@ class IdGapMiner:
             if len(rows) >= 50:
                 base = term
                 for f in _SPILL_REACTION:
+                    if base.endswith(f):
+                        continue  # never mint 'show s01 s01' chains
                     t2 = f"{base} {f}"
                     if t2 == term or t2 in self.searched_terms:
                         continue
