@@ -39,6 +39,7 @@ function dash() {
     d: {},                    /* latest SSE payload                            */
     ranges: RANGES,
     range: '24h',
+    chartMode: 'area',          /* 'area' = vault total, 'bars' = new rows per sample */
     selBlock: null,
     term: '',
     busy: false,
@@ -379,22 +380,37 @@ function dash() {
       if (pts.length < 2) { this._chart = null; return ''; }
 
       const vs = pts.map((p) => p[1]);
-      let mn = Math.min(...vs), mx = Math.max(...vs);
-      const span = (mx - mn) || 1; mn -= span * .06; mx += span * .06;
-      const n = pts.length;
-      const X = (i) => L + (i / (n - 1)) * (R - L);
+      /* bars mode: new rows per sample (5-min granularity) — the speed
+         trace. Area mode: the vault total. Same window, same hover. */
+      const bars = this.chartMode === 'bars';
+      const ds = bars ? vs.slice(1).map((v, i) => Math.max(0, v - vs[i])) : vs;
+      let mn = Math.min(...ds), mx = Math.max(...ds);
+      const span = (mx - mn) || 1;
+      mn = bars ? 0 : mn - span * .06; mx = mx + span * .06;
+      const n = ds.length;
+      const X = (i) => L + (i / Math.max(1, n - 1)) * (R - L);
       const Y = (v) => T + (1 - (v - mn) / (mx - mn)) * (B - T);
 
-      let dpath = 'M' + X(0).toFixed(1) + ' ' + Y(vs[0]).toFixed(1);
-      for (let i = 1; i < n; i++) dpath += ' L' + X(i).toFixed(1) + ' ' + Y(vs[i]).toFixed(1);
       const grid = (y) => `<line x1="${L}" y1="${y}" x2="${R}" y2="${y}" stroke="rgba(154,172,207,.09)" stroke-dasharray="3 4"/>`;
+      let body;
+      if (bars) {
+        const w = Math.max(1, (R - L) / n - 1.5);
+        body = ds.map((v, i) => {
+          const h = Math.max(1, B - Y(v));
+          const hot = v >= mx * 0.7;
+          return `<rect x="${(X(i) - w / 2).toFixed(1)}" y="${(Y(v)).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="1.5" fill="${hot ? '#34d399' : '#3b82f6'}" opacity="${hot ? '.95' : '.55'}"><title>+${fmt(v)} rows</title></rect>`;
+        }).join('');
+      } else {
+        let dpath = 'M' + X(0).toFixed(1) + ' ' + Y(ds[0]).toFixed(1);
+        for (let i = 1; i < n; i++) dpath += ' L' + X(i).toFixed(1) + ' ' + Y(ds[i]).toFixed(1);
+        body = `<path d="${dpath} L${R} ${B} L${L} ${B} Z" fill="url(#gr)"/>` +
+          `<path d="${dpath}" fill="none" stroke="#60a5fa" stroke-width="1.6"/>`;
+      }
 
-      this._chart = { pts, vs, X, Y, L, R, n };
+      this._chart = { pts, vs, ds, bars, X, Y, L, R, n };
       this._mn = mn; this._mx = mx;
 
-      return grid(T) + grid((T + B) / 2) + grid(B) +
-        `<path d="${dpath} L${R} ${B} L${L} ${B} Z" fill="url(#gr)"/>` +
-        `<path d="${dpath}" fill="none" stroke="#60a5fa" stroke-width="1.6"/>`;
+      return grid(T) + grid((T + B) / 2) + grid(B) + body;
     },
     get ylMax() { return this._mx == null ? '—' : fmt(this._mx); },
     get ylMid() { return this._mx == null ? '—' : fmt((this._mx + this._mn) / 2); },
@@ -411,7 +427,9 @@ function dash() {
         : hrs < 1 ? Math.max(1, Math.round(hrs * 60)) + 'm'
         : hrs < 48 ? hrs.toFixed(1) + 'h'
         : (hrs / 24).toFixed(1) + 'd';
-      return gain > 0 ? `+${fmt(gain)} rows / ${cover} · now ${now}` : `now ${now}`;
+      /* live pace over the visible window: the number the 100/min target is read from */
+      const pace = hrs && hrs > 0 && gain > 0 ? ` · ${(gain / hrs / 60).toFixed(1)}/min` : '';
+      return gain > 0 ? `+${fmt(gain)} rows / ${cover}${pace} · now ${now}` : `now ${now}`;
     },
     /* hours of history actually present in the current window (null if unknown) */
     get _coverH() {
@@ -437,9 +455,11 @@ function dash() {
       const vx = (ev.clientX - box.left) / box.width * 620;
       let i = Math.round((vx - c.L) / (c.R - c.L) * (c.n - 1));
       i = Math.max(0, Math.min(c.n - 1, i));
-      const when = new Date(c.pts[i][0] * 1000)
+      const pi = c.bars ? i + 1 : i;   /* bars are per-sample gains, offset by one */
+      const when = new Date(c.pts[pi][0] * 1000)
         .toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' });
-      this.tip = `${when} · ${fmt(c.vs[i])} rows`;
+      this.tip = c.bars ? `${when} · +${fmt(c.ds[i])} rows / 5min`
+        : `${when} · ${fmt(c.vs[i])} rows`;
       this.tipStyle = `left:${Math.round((ev.clientX - box.left) - 4)}px;top:6px`;
     },
 

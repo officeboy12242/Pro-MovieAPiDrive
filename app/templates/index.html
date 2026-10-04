@@ -274,6 +274,10 @@
   <div class="card mb-3.5">
     <h3>
       <span>Vault growth <span class="num" x-text="chartSum"></span></span>
+      <span style="display:inline-flex;gap:6px;align-items:center">
+      <span class="seg" title="area = vault total · bars = new rows per sample">
+        <button :class="{ on: chartMode === 'area' }" @click="chartMode = 'area'">AREA</button><button :class="{ on: chartMode === 'bars' }" @click="chartMode = 'bars'">BARS</button>
+      </span>
       <span class="seg">
         <template x-for="r in ranges" :key="r.k">
           <button :class="{ on: range === r.k }" @click="range = r.k" x-text="r.lab"></button>
