@@ -38,6 +38,16 @@
   </div>
 </header>
 
+<!-- one-line system summary: every subsystem, one glance -->
+<div class="statusbar">
+  <span class="st" x-html="stCrawler"></span>
+  <span class="st" x-html="stRate"></span>
+  <span class="st" x-html="stCov"></span>
+  <span class="st" x-html="stMongo"></span>
+  <span class="st" x-html="stRender"></span>
+  <span class="st" x-html="stClock"></span>
+</div>
+
 <!-- search result popup -->
 <div class="spop" x-show="pop" x-transition @click.outside="pop = null">
   <div class="t">
@@ -78,6 +88,7 @@
         </svg>
         <div style="min-width:0">
           <div class="s" x-html="covSub"></div>
+          <div class="s" x-html="covNext"></div>
           <div class="chips" x-html="covChips"></div>
         </div>
       </div>
@@ -93,6 +104,9 @@
       <div class="statrow"><span class="lab">24 hours</span>
         <span class="bar"><i style="background:var(--pur)" :style="barH24"></i></span>
         <span class="val num" x-text="vh24"></span></div>
+      <div class="statrow" title="live pace against the 100 rows/min goal — tick marks 100"><span class="lab">goal</span>
+        <span class="bar"><i :style="goalBar"></i><b class="gtick"></b></span>
+        <span class="val num" :class="goalCls" x-text="goalText"></span></div>
       <div class="s" x-text="rateSub"></div>
     </div>
 
@@ -108,8 +122,10 @@
         <span class="val num" x-text="vfail"></span></div>
       <div class="s" x-html="healthSub"></div>
     </div>
+  </div>
+
   <!-- ================================================ mining deep-dive -->
-  <!-- moved directly under the KPIs: this row answers "what earns the rows" -->
+  <!-- directly under the KPIs: this row answers "what earns the rows" -->
   <div class="three mb-3.5">
 
     <div class="card">
@@ -182,8 +198,6 @@
       </div>
       <div class="s" x-html="termVerdict"></div>
     </div>
-  </div>
-
   </div>
 
   <!-- =================================================== mongo deep-dive -->
@@ -284,7 +298,7 @@
         </template>
       </span>
     </h3>
-    <div class="sub" style="margin-top:-4px">vault row count over time — slope is speed</div>
+    <div class="sub" style="margin-top:-4px" x-text="chartMode === 'bars' ? 'new rows per sample — bar height is speed' : 'vault row count over time — slope is speed'"></div>
     <div class="chartwrap" @mousemove="chartMove($event)" @mouseleave="tip = null">
       <div class="ylab" style="top:6px" x-text="ylMax"></div>
       <div class="ylab" style="top:50%" x-text="ylMid"></div>

@@ -144,6 +144,43 @@ function dash() {
       return `page ${this.d.uptime_min || 0}m · log ${age == null ? 'missing' : (age < 0 ? 'missing' : age + 's')}`;
     },
 
+    /* ------------------------------------------- one-line system summary */
+    _st(dot, label, value, cls) {
+      return `<i class="sd ${dot}"></i>${label} <b class="${cls || ''}">${value}</b>`;
+    },
+    get stCrawler() {
+      const t = this.pillText;
+      const dot = t === 'live' ? 'g' : (t === 'reconnecting…' ? 'r' : 'a');
+      return this._st(dot, 'crawler', esc(t));
+    },
+    get stRate() {
+      const p = this.vel.per_min;
+      if (p == null) return this._st('', 'rate', '—');
+      const cls = p >= 100 ? 'g' : p >= 50 ? 'a' : 'r';
+      return this._st(cls, 'rate', '+' + fmt(Math.round(p)) + '/min', cls);
+    },
+    get stCov() {
+      const p = this.vault.coverage_pct;
+      return this._st(p == null ? '' : 'g', 'cov', p == null ? '—' : p.toFixed(1) + '%');
+    },
+    get stMongo() {
+      const p = this._dbPct;
+      if (p == null) return this._st('', 'mongo', '—');
+      const cls = p >= 90 ? 'r' : p >= 75 ? 'a' : 'g';
+      return this._st(cls, 'mongo', p.toFixed(0) + '% quota', cls);
+    },
+    get stRender() {
+      const r = this.render;
+      const dot = r.ok ? 'g' : (r.err ? 'r' : '');
+      return this._st(dot, 'render', r.ok ? 'online' : (r.err ? 'error' : '…'));
+    },
+    get stClock() {
+      const s = this._skew;
+      if (s == null) return this._st('', 'clock', '—');
+      const cls = Math.abs(s) > 120 ? 'r' : Math.abs(s) > 30 ? 'a' : 'g';
+      return this._st(cls, 'clock', (s > 0 ? '+' : '') + s + 's', cls);
+    },
+
     /* ------------------------------------------------------------- clock */
     get _skew() { return (this.d.clock || {}).skew_s; },
     get clockText() {
@@ -196,6 +233,15 @@ function dash() {
       if (v.max_id == null) return 'waiting for first Mongo read…';
       return `${fmt(v.rows)} of ${fmt(v.max_id)} site ids · <b>${fmt((v.max_id || 0) - (v.rows || 0))}</b> still missing`;
     },
+    /* next 5% coverage milestone and the rows needed to reach it */
+    get covNext() {
+      const v = this.vault;
+      if (v.rows == null || !v.coverage_pct) return '';
+      const cur = v.coverage_pct / 100;
+      const next = (Math.floor(cur * 20) + 1) / 20;
+      const need = Math.max(0, Math.ceil(next / cur * v.rows) - v.rows);
+      return `next <b>${Math.round(next * 100)}%</b> · <b class="a">${fmt(need)}</b> rows to go`;
+    },
     get covChips() {
       return (this.vault.thin || []).slice(0, 4).map((b) =>
         `<span class="chip clickable" @click="jumpBlock(${b.block})">b${b.block * 25}k <b>${fmt(b.have)}</b></span>`).join('');
@@ -213,6 +259,23 @@ function dash() {
     },
     get rateSub() {
       return this.vel.per_min == null ? 'building history (5-min samples)…' : 'rolling 30-min average';
+    },
+    /* goal meter: live pace against the 100 rows/min target (scale 0–150) */
+    get goalBar() {
+      const p = this.vel.per_min;
+      if (p == null) return 'width:0%';
+      const c = p >= 100 ? 'var(--grn)' : p >= 50 ? 'var(--amb)' : 'var(--red)';
+      return `width:${Math.min(100, p / 150 * 100).toFixed(1)}%;background:${c}`;
+    },
+    get goalCls() {
+      const p = this.vel.per_min;
+      if (p == null) return '';
+      return p >= 100 ? 'g' : p >= 50 ? 'a' : 'r';
+    },
+    get goalText() {
+      const p = this.vel.per_min;
+      if (p == null) return '—';
+      return p >= 100 ? 'goal met' : '100/min';
     },
 
     /* ------------------------------------------------------------ health */
@@ -364,11 +427,29 @@ function dash() {
 
     /* -------------------------------------------------------------- chart */
     get _rangeSecs() { return (RANGES.find((r) => r.k === this.range) || RANGES[2]).secs; },
-    get _pts() {
+    /* raw windowed samples — timestamps are SECONDS; the range is seconds too.
+       (An older *1000 here made every range show ~41 days and the window
+       switcher looked dead.) */
+    get _rawPts() {
       const h = this.d.history || [];
       if (h.length < 2) return [];
-      const cut = h[h.length - 1][0] - this._rangeSecs * 1000;
+      const cut = h[h.length - 1][0] - this._rangeSecs;
       return h.filter((p) => p[0] >= cut);
+    },
+    /* thinned to <=240 buckets (averaged) so long windows stay renderable */
+    get _pts() {
+      const pts = this._rawPts;
+      if (pts.length <= 240) return pts;
+      const n = 240, t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+      const span = Math.max(1, t1 - t0);
+      const sum = new Array(n).fill(0), cnt = new Array(n).fill(0), ts = new Array(n).fill(0);
+      for (const p of pts) {
+        const i = Math.min(n - 1, Math.floor((p[0] - t0) / span * n));
+        sum[i] += p[1]; cnt[i]++; ts[i] = p[0];
+      }
+      const out = [];
+      for (let i = 0; i < n; i++) if (cnt[i]) out.push([ts[i], Math.round(sum[i] / cnt[i])]);
+      return out;
     },
     _chartGain() {
       const p = this._pts;
@@ -379,35 +460,63 @@ function dash() {
       const L = 2, R = 612, T = 10, B = 140;
       if (pts.length < 2) { this._chart = null; return ''; }
 
-      const vs = pts.map((p) => p[1]);
-      /* bars mode: new rows per sample (5-min granularity) — the speed
-         trace. Area mode: the vault total. Same window, same hover. */
+      const grid = (y) => `<line x1="${L}" y1="${y}" x2="${R}" y2="${y}" stroke="rgba(154,172,207,.09)" stroke-dasharray="3 4"/>`;
       const bars = this.chartMode === 'bars';
-      const ds = bars ? vs.slice(1).map((v, i) => Math.max(0, v - vs[i])) : vs;
-      let mn = Math.min(...ds), mx = Math.max(...ds);
+      let series, vals, spanMin = 0;
+
+      if (bars) {
+        /* new rows per sample — the speed trace. Bucketed to <=120 bars so
+           dense windows (24h = 288 samples) stay readable; each bucket sums
+           the gains inside it and carries its own timestamp. */
+        const raw = this._rawPts;
+        const gains = [];
+        for (let i = 1; i < raw.length; i++)
+          gains.push([raw[i][0], Math.max(0, raw[i][1] - raw[i - 1][1])]);
+        const MAXB = 120;
+        if (gains.length <= MAXB) {
+          series = gains;
+          spanMin = gains.length > 1 ? (gains[gains.length - 1][0] - gains[0][0]) / 60 / (gains.length - 1) : 5;
+        } else {
+          const n = MAXB, t0 = gains[0][0], t1 = gains[gains.length - 1][0];
+          const span = Math.max(1, t1 - t0);
+          const sum = new Array(n).fill(0), cnt = new Array(n).fill(0);
+          for (const g of gains) {
+            const i = Math.min(n - 1, Math.floor((g[0] - t0) / span * n));
+            sum[i] += g[1]; cnt[i]++;
+          }
+          series = [];
+          for (let i = 0; i < n; i++) if (cnt[i]) series.push([t0 + (i + .5) * span / n, sum[i]]);
+          spanMin = span / n / 60;
+        }
+        vals = series.map((p) => p[1]);
+      } else {
+        series = pts;
+        vals = pts.map((p) => p[1]);
+      }
+
+      let mn = Math.min(...vals), mx = Math.max(...vals);
       const span = (mx - mn) || 1;
       mn = bars ? 0 : mn - span * .06; mx = mx + span * .06;
-      const n = ds.length;
+      const n = series.length;
       const X = (i) => L + (i / Math.max(1, n - 1)) * (R - L);
       const Y = (v) => T + (1 - (v - mn) / (mx - mn)) * (B - T);
 
-      const grid = (y) => `<line x1="${L}" y1="${y}" x2="${R}" y2="${y}" stroke="rgba(154,172,207,.09)" stroke-dasharray="3 4"/>`;
       let body;
       if (bars) {
         const w = Math.max(1, (R - L) / n - 1.5);
-        body = ds.map((v, i) => {
-          const h = Math.max(1, B - Y(v));
-          const hot = v >= mx * 0.7;
-          return `<rect x="${(X(i) - w / 2).toFixed(1)}" y="${(Y(v)).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="1.5" fill="${hot ? '#34d399' : '#3b82f6'}" opacity="${hot ? '.95' : '.55'}"><title>+${fmt(v)} rows</title></rect>`;
+        body = series.map((p, i) => {
+          const h = Math.max(1, B - Y(p[1]));
+          const hot = p[1] >= mx * 0.7;
+          return `<rect x="${(X(i) - w / 2).toFixed(1)}" y="${Y(p[1]).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="1.5" fill="${hot ? '#34d399' : '#3b82f6'}" opacity="${hot ? '.95' : '.55'}"><title>+${fmt(p[1])} rows</title></rect>`;
         }).join('');
       } else {
-        let dpath = 'M' + X(0).toFixed(1) + ' ' + Y(ds[0]).toFixed(1);
-        for (let i = 1; i < n; i++) dpath += ' L' + X(i).toFixed(1) + ' ' + Y(ds[i]).toFixed(1);
+        let dpath = 'M' + X(0).toFixed(1) + ' ' + Y(series[0][1]).toFixed(1);
+        for (let i = 1; i < n; i++) dpath += ' L' + X(i).toFixed(1) + ' ' + Y(series[i][1]).toFixed(1);
         body = `<path d="${dpath} L${R} ${B} L${L} ${B} Z" fill="url(#gr)"/>` +
           `<path d="${dpath}" fill="none" stroke="#60a5fa" stroke-width="1.6"/>`;
       }
 
-      this._chart = { pts, vs, ds, bars, X, Y, L, R, n };
+      this._chart = { pts: series, vals, bars, X, Y, L, R, n, spanMin };
       this._mn = mn; this._mx = mx;
 
       return grid(T) + grid((T + B) / 2) + grid(B) + body;
@@ -455,11 +564,11 @@ function dash() {
       const vx = (ev.clientX - box.left) / box.width * 620;
       let i = Math.round((vx - c.L) / (c.R - c.L) * (c.n - 1));
       i = Math.max(0, Math.min(c.n - 1, i));
-      const pi = c.bars ? i + 1 : i;   /* bars are per-sample gains, offset by one */
-      const when = new Date(c.pts[pi][0] * 1000)
+      const when = new Date(c.pts[i][0] * 1000)
         .toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' });
-      this.tip = c.bars ? `${when} · +${fmt(c.ds[i])} rows / 5min`
-        : `${when} · ${fmt(c.vs[i])} rows`;
+      this.tip = c.bars
+        ? `${when} · +${fmt(c.vals[i])} rows${c.spanMin ? ' / ~' + Math.round(c.spanMin) + 'min' : ''}`
+        : `${when} · ${fmt(c.vals[i])} rows`;
       this.tipStyle = `left:${Math.round((ev.clientX - box.left) - 4)}px;top:6px`;
     },
 
