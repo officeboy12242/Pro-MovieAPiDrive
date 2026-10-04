@@ -56,6 +56,7 @@
 
     <div class="card">
       <h3>Vault rows <span class="tag">mongo atlas</span></h3>
+      <div class="sub">movie/show links stored in the vault</div>
       <div class="v num" x-ref="rows" id="rows">—</div>
       <span class="delta num" id="rowsdelta"></span>
       <div class="chips" x-html="rowChips"></div>
@@ -63,6 +64,7 @@
 
     <div class="card">
       <h3>Site coverage</h3>
+      <div class="sub">share of the site's uploads we already hold</div>
       <div class="gwrap">
         <svg width="108" height="108" viewBox="0 0 120 120" aria-label="coverage">
           <defs><linearGradient id="gg" x1="0" y1="0" x2="1" y2="1">
@@ -83,6 +85,7 @@
 
     <div class="card">
       <h3>Push velocity</h3>
+      <div class="sub">new vault rows per minute — the one speed number</div>
       <div class="v num" id="rate">—<small> rows/min</small></div>
       <div class="statrow"><span class="lab">last hour</span>
         <span class="bar"><i style="background:var(--blu)" :style="barH1"></i></span>
@@ -95,6 +98,7 @@
 
     <div class="card">
       <h3>Crawl health <span class="tag">per min · 5m window</span></h3>
+      <div class="sub">searches finishing vs failing — not rows, just attempts</div>
       <div class="v num" id="health">—<small> ok/min</small></div>
       <div class="statrow"><span class="lab">success</span>
         <span class="bar"><i style="background:var(--grn)" :style="barOk"></i></span>
@@ -104,11 +108,88 @@
         <span class="val num" x-text="vfail"></span></div>
       <div class="s" x-html="healthSub"></div>
     </div>
+  <!-- ================================================ mining deep-dive -->
+  <!-- moved directly under the KPIs: this row answers "what earns the rows" -->
+  <div class="three mb-3.5">
+
+    <div class="card">
+      <h3>Mining scoreboard <span class="tag" x-text="sbTag"></span></h3>
+      <div class="sub">new rows found by idgap searches in the window</div>
+      <div class="sbhero">
+        <div class="sbnum"><div class="v num" x-text="sbH1"></div><div class="sblab">rows · last hour</div></div>
+        <div class="sbnum"><div class="v num" x-text="sbH2"></div><div class="sblab">rows · hour before</div></div>
+      </div>
+      <div class="sbrow">
+        <span class="chip" title="idgap searches in the window">searches <b class="num" x-text="sbSearches"></b></span>
+        <span class="chip" title="new rows per search">yield <b class="num g" x-text="sbYield"></b></span>
+        <span class="chip" title="searches that hit the 50-row site cap">capped <b class="num" x-text="sbCapped"></b></span>
+        <span class="chip" title="engine retries">retries <b class="num a" x-text="sbRetries"></b></span>
+        <span class="chip" title="rows per minute across all agents">rate <b class="num" x-text="sbPerMin"></b></span>
+        <span class="chip" title="hardest-working lane">top lane <b class="num" x-text="sbKind"></b></span>
+      </div>
+      <div class="s mt-3" x-html="sbContext"></div>
+      <div class="sblab" style="margin:14px 0 6px">top jackpots</div>
+      <div class="sblist scroll">
+        <template x-for="(j, i) in jackpots" :key="i">
+          <div class="jk"><b x-text="'+' + fmt(j.new)"></b><span x-text="j.term"></span>
+            <small x-text="j.new >= 40 ? 'jackpot' : (j.new >= 20 ? 'big' : 'good')"></small></div>
+        </template>
+        <span class="faint" x-show="!jackpots.length">no wins in window</span>
+      </div>
+    </div>
+
+    <!-- NEW: per-lane dispatch table -->
+    <div class="card">
+      <h3>Lane dispatch <span class="tag" x-text="laneTag"></span></h3>
+      <div class="sub">queued discovery searches by lane — where effort waits</div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>lane</th><th class="num">dispatched</th><th class="num">share</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="l in lanes" :key="l.name">
+              <tr>
+                <td x-text="l.name"></td>
+                <td class="num" x-text="fmt(l.n)"></td>
+                <td class="num dim" x-text="l.pct + '%'"></td>
+                <td style="width:38%"><span class="bar2"><i :style="l.style"></i></span></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div class="s" x-html="laneSub"></div>
+    </div>
+
+    <!-- NEW: idgap term leaderboard -->
+    <div class="card">
+      <h3>IdGap terms <span class="tag" x-text="termTag"></span></h3>
+      <div class="sub">what each query shape earned — per 100 = new rows per 100 searches</div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>term</th><th class="num">tries</th><th class="num">new</th><th class="num">hit%</th><th class="num">per 100</th></tr></thead>
+          <tbody>
+            <template x-for="t in terms" :key="t.name">
+              <tr>
+                <td class="t" x-text="t.name"></td>
+                <td class="num dim" x-text="fmt(t.tries)"></td>
+                <td class="num g" x-text="fmt(t.new)"></td>
+                <td class="num dim" x-text="t.hit"></td>
+                <td class="num g" x-text="t.per100"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div class="s" x-html="termVerdict"></div>
+    </div>
+  </div>
+
   </div>
 
   <!-- =================================================== mongo deep-dive -->
   <div class="card mb-3.5">
     <h3>MongoDB atlas storage <span class="tag" x-text="dbTag"></span></h3>
+    <div class="sub">Atlas disk quota — data vs indexes vs free space</div>
     <div class="dbrow">
       <div style="min-width:130px">
         <div class="v num" id="dbused">—<small> MB used</small></div>
@@ -148,6 +229,7 @@
       Id-block fill rate
       <span class="tag num">each bar = 25,000 site ids · dashed = 60% target · click a bar to inspect</span>
     </h3>
+    <div class="sub" style="margin-top:-4px">how full each 25k-id slice of the site is — short bars are the gaps we mine</div>
     <div class="hmwrap">
       <div class="hm" id="hm">
         <div class="hline" style="bottom:25%"><span>25</span></div>
@@ -198,6 +280,7 @@
         </template>
       </span>
     </h3>
+    <div class="sub" style="margin-top:-4px">vault row count over time — slope is speed</div>
     <div class="chartwrap" @mousemove="chartMove($event)" @mouseleave="tip = null">
       <div class="ylab" style="top:6px" x-text="ylMax"></div>
       <div class="ylab" style="top:50%" x-text="ylMid"></div>
@@ -208,81 +291,11 @@
     </div>
   </div>
 
-  <!-- ================================================ mining deep-dive -->
-  <div class="three mb-3.5">
-
-    <div class="card">
-      <h3>Mining scoreboard <span class="tag" x-text="sbTag"></span></h3>
-      <div class="sbhero">
-        <div class="sbnum"><div class="v num" x-text="sbH1"></div><div class="sblab">rows · last hour</div></div>
-        <div class="sbnum"><div class="v num" x-text="sbH2"></div><div class="sblab">rows · hour before</div></div>
-      </div>
-      <div class="sbrow">
-        <span class="chip" title="idgap searches in the window">searches <b class="num" x-text="sbSearches"></b></span>
-        <span class="chip" title="new rows per search">yield <b class="num g" x-text="sbYield"></b></span>
-        <span class="chip" title="searches that hit the 50-row site cap">capped <b class="num" x-text="sbCapped"></b></span>
-        <span class="chip" title="engine retries">retries <b class="num a" x-text="sbRetries"></b></span>
-        <span class="chip" title="rows per minute across all agents">rate <b class="num" x-text="sbPerMin"></b></span>
-        <span class="chip" title="hardest-working lane">top lane <b class="num" x-text="sbKind"></b></span>
-      </div>
-      <div class="s mt-3" x-html="sbContext"></div>
-      <div class="sblab" style="margin:14px 0 6px">top jackpots</div>
-      <div class="sblist scroll">
-        <template x-for="(j, i) in jackpots" :key="i">
-          <div class="jk"><b x-text="'+' + fmt(j.new)"></b><span x-text="j.term"></span>
-            <small x-text="j.new >= 40 ? 'jackpot' : (j.new >= 20 ? 'big' : 'good')"></small></div>
-        </template>
-        <span class="faint" x-show="!jackpots.length">no wins in window</span>
-      </div>
-    </div>
-
-    <!-- NEW: per-lane dispatch table -->
-    <div class="card">
-      <h3>Lane dispatch <span class="tag" x-text="laneTag"></span></h3>
-      <div class="scroll">
-        <table>
-          <thead><tr><th>lane</th><th class="num">dispatched</th><th class="num">share</th><th></th></tr></thead>
-          <tbody>
-            <template x-for="l in lanes" :key="l.name">
-              <tr>
-                <td x-text="l.name"></td>
-                <td class="num" x-text="fmt(l.n)"></td>
-                <td class="num dim" x-text="l.pct + '%'"></td>
-                <td style="width:38%"><span class="bar2"><i :style="l.style"></i></span></td>
-              </tr>
-            </template>
-          </tbody>
-        </table>
-      </div>
-      <div class="s" x-html="laneSub"></div>
-    </div>
-
-    <!-- NEW: idgap term leaderboard -->
-    <div class="card">
-      <h3>IdGap terms <span class="tag" x-text="termTag"></span></h3>
-      <div class="scroll">
-        <table>
-          <thead><tr><th>term</th><th class="num">tries</th><th class="num">new</th><th class="num">hit%</th></tr></thead>
-          <tbody>
-            <template x-for="t in terms" :key="t.name">
-              <tr>
-                <td class="t" x-text="t.name"></td>
-                <td class="num dim" x-text="fmt(t.tries)"></td>
-                <td class="num g" x-text="fmt(t.new)"></td>
-                <td class="num dim" x-text="t.hit"></td>
-              </tr>
-            </template>
-          </tbody>
-        </table>
-      </div>
-      <div class="s" x-html="termSub"></div>
-    </div>
-  </div>
-
   <!-- ================================================== feeds + crawler -->
   <div class="two mb-3.5">
     <div class="card">
       <h3>Newest pushes → mongo</h3>
+      <div class="sub">latest rows written, newest first — green flash = just arrived</div>
       <div class="scroll">
         <table>
           <thead><tr><th>id</th><th>title</th><th>src</th></tr></thead>
@@ -301,6 +314,7 @@
 
     <div class="card">
       <h3>Crawler log</h3>
+      <div class="sub">raw crawler output, newest at the bottom — red = failure</div>
       <div class="lg" id="log" x-ref="log"><div x-html="logHtml"></div></div>
     </div>
   </div>
@@ -310,6 +324,7 @@
 
     <div class="card">
       <h3>Fleet <span class="tag" x-text="fleetTag"></span></h3>
+      <div class="sub">agents running and work waiting in queues</div>
       <div class="v" x-html="fleetV"></div>
       <div class="s" x-html="fleetSub"></div>
       <div class="lanes" x-html="lanesHtml"></div>
@@ -321,6 +336,7 @@
     <!-- NEW: render serve panel -->
     <div class="card">
       <h3>Render serve <span class="tag" x-text="renderTag"></span></h3>
+      <div class="sub">public site serving the vault — where rows go after mongo</div>
       <div class="flex items-center gap-2 mb-2">
         <span class="statdot" :class="renderDot"></span>
         <span class="v text-[20px]" x-text="renderState"></span>
@@ -339,6 +355,7 @@
     <!-- NEW: site crawler + clock panel -->
     <div class="card">
       <h3>Site crawler <span class="tag" x-text="siteTag"></span></h3>
+      <div class="sub">newest upload on mkvbase.site vs what we hold</div>
       <div class="v num text-[22px]" x-text="fmt(site.site_max_id)"></div>
       <div class="s" x-html="siteSub"></div>
       <table class="mt-2">

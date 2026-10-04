@@ -192,7 +192,7 @@ function dash() {
     },
     get covSub() {
       const v = this.vault;
-      if (v.max_id == null) return 'waiting for vault head';
+      if (v.max_id == null) return 'waiting for first Mongo read…';
       return `${fmt(v.rows)} of ${fmt(v.max_id)} site ids · <b>${fmt((v.max_id || 0) - (v.rows || 0))}</b> still missing`;
     },
     get covChips() {
@@ -496,7 +496,9 @@ function dash() {
         .map(([name, v]) => {
           const tries = v.tries || 0, nu = v.new || 0;
           return { name, tries, new: nu,
-            hit: tries ? (nu / tries * 100).toFixed(1) + '%' : '—' };
+            hit: tries ? (nu / tries * 100).toFixed(1) + '%' : '—',
+            /* new rows per 100 searches: the comparable yield number */
+            per100: tries ? (nu / tries * 100).toFixed(1) : '—' };
         })
         .sort((a, b) => b.new - a.new);
     },
@@ -504,11 +506,18 @@ function dash() {
       const t = this.d.idgap || {};
       return `${fmt(t.terms)} terms searched`;
     },
-    get termSub() {
+    /* plain-English verdict: which query shape earns, and the totals */
+    get termVerdict() {
       const t = this.terms;
       if (!t.length) return 'no term statistics yet';
       const tot = t.reduce((a, x) => a + x.new, 0);
-      return `<b>${fmt(tot)}</b> new rows from these terms · <b>${fmt(t.reduce((a, x) => a + x.tries, 0))}</b> tries`;
+      const tries = t.reduce((a, x) => a + x.tries, 0);
+      const earners = t.filter((x) => x.tries >= 5 && x.new > 0)
+        .sort((a, b) => (b.new / b.tries) - (a.new / a.tries));
+      const best = earners.length ? earners[0] : t[0];
+      const rate = best.tries ? (best.new / best.tries * 100).toFixed(1) : '—';
+      return `best shape <b class="g">${esc(best.name)}</b> at <b>${rate}</b> new rows per 100 searches` +
+        ` · <b>${fmt(tot)}</b> new rows from <b>${fmt(tries)}</b> tries`;
     },
 
     /* -------------------------------------------------------------- feeds */
