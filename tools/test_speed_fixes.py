@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -559,6 +560,48 @@ def test_slice_pool_has_faceted_season_slices() -> None:
     print(f"PASS  slice pool: {n} slices, faceted season slices lead")
 
 
+def test_season_slices_outrank_head_facet() -> None:
+    """Season slices (0.337 realized) must be picked before head x facet
+    (0.235 realized). A 2026-10-05 attempt to prioritize head x facet on
+    its stale 1.35 lifetime yield starved the slice lane and DROPPED the
+    rate 21 -> 16/min; reverted. Realized yields, not lifetime, set priority.
+    """
+    m = make_miner()
+    m._seeds_for_block = (lambda blk, n=6, fresh_only=True: ["solo head"])
+    m._slice_pool = [("show s02", "slice-season")]
+    m._fresh_heads = lambda: []
+    m._series_heads = lambda: []
+    blk, era, terms = m._next_terms(3, "a1")
+    # season slice wins: 'slc:...' not 'solo head <facet>'
+    assert terms and terms[0] == "slc:slice-season:show s02", terms
+    print("PASS  season slices outrank head x facet (0.337 > 0.235 realized)")
+
+
+def test_idgap_uses_semaphore_gated_search() -> None:
+    """idgap must call client.search(), never search_http() directly.
+
+    client.search() is already http-first (client.py _fetch), AND it holds
+    the _http_sem permit that enforces MKV_HTTP_CONCURRENCY. search_http()
+    bypasses that semaphore, so calling it directly would let the miners
+    stampede Cloudflare past the concurrency cap. Measured 2026-10-05:
+    both paths report _mode='http' and are indistinguishable in latency.
+    """
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "app", "idgap.py"),
+        encoding="utf-8").read()
+    body = re.search(r"def step\(.*?\n\n    def ", src, re.S)
+    assert body, "could not locate step() body"
+    # strip comments: the guard is about CODE, not the prose that warns
+    # against exactly this mistake.
+    step_code = "\n".join(
+        line for line in body.group(0).splitlines()
+        if not line.strip().startswith("#"))
+    assert "self.client.search(term)" in step_code, "step() must use client.search"
+    assert "search_http" not in step_code, \
+        "step() must not call search_http: it bypasses the _http_sem permit"
+    print("PASS  idgap transport: semaphore-gated search(), no search_http bypass")
+
+
 def test_nat64_resolver_guard() -> None:
     """DNS64 synthesizes 64:ff9b::/96 AAAA records for Atlas; pymongo must not
     dial them, or every shard reads Unknown and the lanes self-disable."""
@@ -645,6 +688,8 @@ if __name__ == "__main__":
     test_slice_channel_claims_each_slice_once()
     test_slice_selffeed_no_degenerate_chains()
     test_slice_pool_has_faceted_season_slices()
+    test_season_slices_outrank_head_facet()
+    test_idgap_uses_semaphore_gated_search()
     test_nat64_resolver_guard()
     test_resolver_guard_reraises_dns_failure()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
