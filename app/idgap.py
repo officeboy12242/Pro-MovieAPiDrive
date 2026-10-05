@@ -76,11 +76,16 @@ _EP_SUFFIXES = tuple([f"s{n:02d}" for n in range(1, 8)]
 # returns 0 rows (nothing to surface), and bare 'show sXXeYY' episode probes
 # mostly return 0 rows (the site lacks those uploads), so season slices lead
 # and episode slices are the bounded tail of the pool.
-_SLICE_POOL_CAP = 20000     # bounded pool: season slices first, episodes fill
-_SLICE_SEASON_CAP = 16000   # ...of which at most this many are season slices
+_SLICE_POOL_CAP = 40000     # bounded pool: season slices first, episodes fill
+_SLICE_SEASON_CAP = 32000   # ...of which at most this many are season slices
 _SLICE_QUEUE_CAP = 500      # bounded self-feed queue (mirrors _spill_queue)
 _SLICE_SEASON_HI = 40       # per-show season expansion bound (junk guard)
 _SLICE_EP_HI = 12           # per-season episode expansion bound
+# Facet-qualified season slices: 'show sNN hindi' is a DIFFERENT query from
+# 'show sNN' -- it returns the newest 50 rows matching all three tokens, a set
+# the bare season slice never reaches. Bare slices are measured mined out
+# (0 new); facet slices are unsearched and reach older, unvaulted rows.
+_SLICE_FACETS = ("hindi", "1080p", "720p", "esub", "mkv")
 import re as _re
 
 _HEAD_WORD = _re.compile(r"[a-z0-9]+")
@@ -803,6 +808,7 @@ class IdGapMiner:
             searched = self.searched_terms
         multi: list[tuple[str, str]] = []   # >=2 held seasons: proven catalog depth
         single: list[tuple[str, str]] = []  # 1 held season: s01 first (scam-1992 shape)
+        faceted: list[tuple[str, str]] = []  # season+facet: the new supply
         eps: list[tuple[str, str]] = []
         for h in sorted(shows):
             ss = shows[h]
@@ -820,10 +826,18 @@ class IdGapMiner:
                 t = f"{h} s{s:02d}"
                 if t not in searched:
                     dest.append((t, "slice-season"))
+                # Facet-qualified season slices: a different query reaching a
+                # different (older) result set than the bare season slice.
+                for f in _SLICE_FACETS:
+                    t2 = f"{h} s{s:02d} {f}"
+                    if t2 not in searched:
+                        faceted.append((t2, "slice-season"))
         # s01 of every single-season show outranks their s05: lower seasons
         # exist more often, and unsearched s01 slices measured 16 new/search.
         single.sort(key=lambda tk: (int(tk[0].rsplit(" ", 1)[-1][1:]), tk[0]))
-        season = multi + single
+        # Faceted slices lead: bare season slices are measured mined out
+        # (0 new), so the unsearched facet-qualified slices are the new supply.
+        season = faceted + multi + single
         for h in sorted(shows, key=lambda h: (-len(shows[h]), h)):
             for s in sorted(shows[h]):
                 top = min(max(epmax.get((h, s), 6), 6), _SLICE_EP_HI)

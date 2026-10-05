@@ -519,6 +519,46 @@ def test_slice_selffeed_no_degenerate_chains() -> None:
     print("PASS  slice self-feed: no degenerate facet/season chains minted")
 
 
+def test_slice_pool_has_faceted_season_slices() -> None:
+    """The slice pool must include facet-qualified season slices, leading it.
+
+    Bare 'show sNN' slices are measured mined out (0 new rows). The pool
+    adds 'show sNN facet' slices (hindi/1080p/720p/esub/mkv) -- different
+    queries reaching older, unvaulted rows -- and they lead the pool.
+    """
+    class _Col:
+        def __init__(self, titles):
+            self._titles = titles
+        def find(self, *a, **k):
+            return self
+        def batch_size(self, n):
+            return self
+        def __iter__(self):
+            return iter([{"title": t} for t in self._titles])
+
+    m = make_miner()
+    m.index = SimpleNamespace(cols=lambda: [
+        _Col(["Show S01E01", "Show S02E01", "Show S01E02"])])
+    n = m._build_slice_pool()
+    pool = [t for t, _ in m._slice_pool]
+    assert n > 0, "pool build returned nothing"
+    assert any(t.endswith(" s01 hindi") for t in pool), f"no faceted s01: {pool[:5]}"
+    assert any(t.endswith(" s02 1080p") for t in pool), f"no faceted s02: {pool[:5]}"
+
+    def is_bare(t):
+        p = t.split(" ")
+        return len(p) == 2 and p[1].startswith("s")
+
+    def is_faceted(t):
+        p = t.split(" ")
+        return len(p) == 3 and p[1].startswith("s")
+
+    first_bare = next((i for i, t in enumerate(pool) if is_bare(t)), len(pool))
+    first_faceted = next((i for i, t in enumerate(pool) if is_faceted(t)), len(pool))
+    assert first_faceted < first_bare, f"faceted must lead: pool[:6]={pool[:6]}"
+    print(f"PASS  slice pool: {n} slices, faceted season slices lead")
+
+
 def test_nat64_resolver_guard() -> None:
     """DNS64 synthesizes 64:ff9b::/96 AAAA records for Atlas; pymongo must not
     dial them, or every shard reads Unknown and the lanes self-disable."""
@@ -603,6 +643,8 @@ if __name__ == "__main__":
     test_save_is_atomic_and_corrupt_load_is_loud()
     test_phrase_channel_serves_when_token_pool_is_empty()
     test_slice_channel_claims_each_slice_once()
+    test_slice_selffeed_no_degenerate_chains()
+    test_slice_pool_has_faceted_season_slices()
     test_nat64_resolver_guard()
     test_resolver_guard_reraises_dns_failure()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
