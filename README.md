@@ -119,6 +119,8 @@ set MKV_ENGINE=drissionpage                      # or camoufox
 | `GET /search?term=predestination` | signed search, JSON rows (TTL-cached 5 min) |
 | `GET /search?term=x&refresh=true` | force a live scrape, bypass cache |
 | `GET /recent` | latest 50 links posted site-wide |
+| `GET /trending` | the titles people are searching right now (live origin, stale-fallback) |
+| `GET /links?limit=&q=` | deduplicated index of every row ever seen, site-style token match |
 | `GET /saved` | list persisted result files |
 | `GET /saved/search_predestination.json` | fetch a persisted result set |
 | `POST /cache/clear` | drop all cached results |
@@ -137,6 +139,45 @@ plain HTTPS with a Firefox TLS fingerprint (curl_cffi). mkvbase re-issues its
 `mkv_*` cookies on every response; absorbing them keeps the session alive
 without a browser, so the browser is closed right after clearance and only
 relaunched when Cloudflare's `cf_clearance` itself expires.
+
+## Live origin on Render free, no browser (`MKV_BROWSER_FREE`)
+
+Serve-only mode answers from data another host pushed. `MKV_BROWSER_FREE=true`
+instead makes this instance hit mkvbase itself over plain HTTPS and **never launch a
+browser** — the client refuses every browser path, and `Dockerfile.browserfree`
+ships no browser stack to refuse with, so an OOM kill on the 512MB plan is not a
+failure mode you can reach. Deploy it with `render-browserfree.yaml`.
+
+The session has to come from somewhere other than a clearance. First one that works:
+
+1. **`MKV_ORIGIN_KEY`** — the owner's Cloudflare skip-rule below. No challenge at all.
+2. **A cookieless IP** — a bare `GET /api/links` sets every `mkv_*` cookie unchallenged
+   (`_bootstrap_nokey`). Self-sufficient: nothing else has to be running.
+3. **A borrowed `cf_clearance`** — a browser-capable host (the home PC) publishes its
+   cleared session into the Mongo `sessions` collection; this instance reads it
+   (`_refresh_from_shared`). Works, but it depends on the publisher, and
+   `cf_clearance` is IP-bound, so a datacenter egress IP is the thing that can break it.
+
+`GET /health` gives the verdict without guessing:
+
+| `session_source` | meaning |
+|---|---|
+| `origin-key` / `nokey` | self-sufficient — no other host involved |
+| `shared` | borrowing a published clearance; depends on the publisher |
+| `null` + `http_verified: false` | none of the three worked; `/search` returns 503 — add `MKV_PROXY` or `MKV_ORIGIN_KEY` |
+
+Measured browser-free, live origin, no browser process ever opened:
+
+| call | result | time |
+|---|---|---|
+| `GET /health` | `browser_free:true source:shared http_verified:true browser_open:false` | — |
+| `GET /trending` | 10 titles, `source:origin` | 1.2s |
+| `GET /search?term=13+reasons+why+s02` | 50 rows, `mode:http` | 1.5s |
+| `GET /recent` | 50 rows | ~1.0s |
+
+With no Mongo URI configured the same instance refuses cleanly instead of trying a
+browser: warmer `state:failed`, `/search` 503 with `no session available
+(source=None, browser_free=True)`. That is the intended behaviour, not a bug.
 
 ## Owner allowlist: no browser at all (recommended for Render free)
 

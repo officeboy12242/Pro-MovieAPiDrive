@@ -131,6 +131,14 @@ class MkvbaseClient:
         self._origin_header = os.getenv("MKV_ORIGIN_HEADER", "X-Mkv-Key")
         self._release_browser = os.getenv("MKV_RELEASE_BROWSER", "true").lower() in ("1", "true", "yes")
         self.http_verified: bool | None = None  # did plain HTTP pass after the last clearance?
+        # Browser-free mode (Render free = 512MB, or any host that must never launch a
+        # browser): the session must come from the owner skip-rule, a bare /api/links GET,
+        # or a borrowed cf_clearance. Every browser path is refused with a clear error
+        # instead of being OOM-killed mid-launch.
+        self.browserless = os.getenv("MKV_BROWSER_FREE", "").lower() in ("1", "true", "yes")
+        # Where the live session came from: file | shared | origin-key | nokey | browser.
+        # Reported by GET /health so a headless host's verdict is readable from outside.
+        self.session_source: str | None = None
         # cf_clearance values that just got a 403 — never re-borrow these from Mongo/disk
         self._rejected_cf: set[str] = set()
         # Playwright/Camoufox sync objects are thread-affine and refuse a running asyncio
@@ -218,6 +226,7 @@ class MkvbaseClient:
                 s = Session(cookies=data.get("cookies", {}), user_agent=data.get("user_agent", ""))
                 if s.has_mkv_session():
                     self._session = s
+                    self.session_source = "file"
             except Exception:
                 pass
         if self._session is None:
@@ -264,6 +273,7 @@ class MkvbaseClient:
         s = Session(cookies=doc["cookies"], user_agent=doc.get("user_agent", ""))
         if s.has_mkv_session():
             self._session = s
+            self.session_source = "shared"
             return True
         return False
 
@@ -287,6 +297,7 @@ class MkvbaseClient:
             if self._session is not None and self._session.cookies == s.cookies:
                 return False  # already holding this exact session
             self._session = s
+            self.session_source = "shared"
         self._persist_session()
         return True
 
@@ -348,6 +359,7 @@ class MkvbaseClient:
         with self._lock:
             if self._session is s:
                 self._session = None
+                self.session_source = None
         if not cf_dead:
             return
         cf = (s.cookies or {}).get("cf_clearance") or ""
@@ -377,6 +389,10 @@ class MkvbaseClient:
         return self._on_engine(self._bootstrap_locked, timeout_s)
 
     def _bootstrap_locked(self, timeout_s: int | None = None) -> Session:
+        if self.browserless:
+            raise MkvbaseError("MKV_BROWSER_FREE is set: this host must never launch a browser. "
+                               "Needs a session from MKV_ORIGIN_KEY, an unchallenged IP, or a "
+                               "borrowed cf_clearance (Mongo sessions collection).")
         s = self.engine.get_session(f"{self.base}/api/links", timeout_s=timeout_s or self._bootstrap_timeout)
         if not s.has_mkv_session():
             raise MkvbaseError(f"Cloudflare did not clear: no mkv_* cookies after {timeout_s or self._bootstrap_timeout}s "
@@ -384,6 +400,7 @@ class MkvbaseClient:
         with self._lock:
             self._session = s
             self._persist_session()
+        self.session_source = "browser"
         return s
 
     def _bootstrap_nokey(self) -> bool:
@@ -416,6 +433,7 @@ class MkvbaseClient:
         with self._lock:
             self._session = s
         self._persist_session()
+        self.session_source = "nokey"
         return True
 
     def ensure_session(self, timeout_s: int | None = None) -> bool:
@@ -451,6 +469,12 @@ class MkvbaseClient:
         if self._refresh_from_shared() and self._renew_http() and self.session_ready():
             self.http_verified = True
             return True
+        if self.browserless:
+            # No owner key, no cookieless IP, nothing borrowable: stop here rather than
+            # launch a browser that would be OOM-killed anyway. http_verified stays
+            # False so callers answer 503 with an explanation instead of hanging.
+            self.http_verified = False
+            return False
         per = int(os.getenv("MKV_CLEAR_ATTEMPT_S", "70"))
         attempts = int(os.getenv("MKV_CLEAR_ATTEMPTS", "3"))
         budget = int(timeout_s or self._bootstrap_timeout)
@@ -496,6 +520,7 @@ class MkvbaseClient:
         if not self.session_ready():
             self._drop_session(s)
             return False
+        self.session_source = "origin-key"
         return True
 
     def _renew_http(self) -> bool:
@@ -664,6 +689,18 @@ class MkvbaseClient:
                 pass
             except MkvbaseError:
                 pass
+            if self.browserless:
+                # Retry once against a freshly borrowed clearance, then give up. Never
+                # the browser: on this host (512MB) a launch is an OOM kill, not a fetch.
+                if self._refresh_from_shared():
+                    try:
+                        return self._fetch_http(make_url), "http"
+                    except (NeedsSession, MkvbaseError):
+                        pass
+                self.http_verified = False
+                raise NeedsSession("browser-free host has no usable session "
+                                   "(no MKV_ORIGIN_KEY, challenged IP, no borrowable "
+                                   "cf_clearance in the shared store)")
             return self._fetch_browser(make_url, timeout_s)
         finally:
             self._http_sem.release()

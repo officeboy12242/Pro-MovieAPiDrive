@@ -705,6 +705,98 @@ def test_resolver_guard_reraises_dns_failure() -> None:
     print("PASS  resolver guard: DNS failure propagates, not an UnboundLocalError")
 
 
+def test_browser_free_client_never_launches_a_browser() -> None:
+    """MKV_BROWSER_FREE must make every browser path unreachable, not merely unlikely.
+
+    Render free is 512MB; a Camoufox launch there is an OOM kill, which takes the
+    whole API process with it. So in browser-free mode:
+      1. ensure_session() returns False instead of falling through to the clear loop
+         when there is no owner key, no cookieless IP and nothing to borrow.
+      2. _fetch() never calls _fetch_browser -- it re-borrows and raises NeedsSession.
+      3. _bootstrap_locked() itself refuses, so no other caller can reach the engine.
+    """
+    from app.client import MkvbaseClient, MkvbaseError, NeedsSession
+
+    os.environ["MKV_BROWSER_FREE"] = "true"
+    try:
+        c = MkvbaseClient.__new__(MkvbaseClient)   # no __init__: no Mongo, no net
+        c.browserless = True
+        c._session = None
+        c._session_source_set = None
+        c.session_source = None
+        c.http_verified = None
+        c._rejected_cf = set()
+        c._origin_key = None
+        c._clear_lock = threading.Lock()
+        c._lock = threading.RLock()
+        c._bootstrap_timeout = 1
+
+        cleared = []
+
+        # 1) ensure_session stops before the browser loop
+        c._bootstrap_http = lambda: False
+        c._bootstrap_nokey = lambda: False
+        c._refresh_from_shared = lambda: False
+        c._bootstrap = lambda *a, **k: cleared.append("browser")
+        assert c.ensure_session(timeout_s=1) is False, "browser-free ensure_session claimed success"
+        assert c.http_verified is False, "http_verified must be False when nothing worked"
+        assert not cleared, "browser clearance attempted on a browser-free host"
+
+        # 2) _fetch re-borrows, then raises -- never hands off to the browser
+        c._fetch_http = lambda make_url: (_ for _ in ()).throw(NeedsSession("no clearance"))
+        c._http_sem = _PrioritySemaphore(1)
+        c._fetch_browser = lambda make_url, timeout_s: cleared.append("browser-fallback")
+        c.ensure_session = lambda timeout_s=None: False
+        try:
+            c._fetch(lambda ck: "http://x", 1)
+            assert False, "browser-free _fetch returned instead of raising"
+        except NeedsSession as e:
+            assert "browser-free" in str(e), e
+        assert not cleared, "browser fallback taken on a browser-free host"
+
+        # 3) the bootstrap itself is a hard stop even if something calls it directly
+        c._engine = object()
+        try:
+            c._bootstrap_locked(1)
+            assert False, "_bootstrap_locked did not refuse in browser-free mode"
+        except MkvbaseError as e:
+            assert "MKV_BROWSER_FREE" in str(e), e
+    finally:
+        os.environ.pop("MKV_BROWSER_FREE", None)
+    print("PASS  browser-free: no browser launch from ensure_session, _fetch or _bootstrap_locked")
+
+
+def test_browser_free_flag_is_read_from_env() -> None:
+    """The flag has to come from the environment so every entry point (API, pusher,
+    idgap) inherits it without a code change -- that is how Render gets it."""
+    from app.client import MkvbaseClient
+    for value, want in (("true", True), ("1", True), ("yes", True), ("false", False), ("", False)):
+        os.environ["MKV_BROWSER_FREE"] = value
+        try:
+            assert MkvbaseClient(None).browserless is want, f"MKV_BROWSER_FREE={value!r}"
+        finally:
+            os.environ.pop("MKV_BROWSER_FREE", None)
+    print("PASS  MKV_BROWSER_FREE parsed from env (true/1/yes/false/empty)")
+
+
+def test_api_exposes_trending_and_reports_the_browser_free_verdict() -> None:
+    """GET /trending (the unsigned origin route found in the site's bundle) and a
+    /health body that says whether this host is live or browser-free."""
+    from app.main import app
+    routes = {r.path for r in app.routes if hasattr(r, "path")}
+    for path in ("/trending", "/search", "/links", "/recent", "/health"):
+        assert path in routes, f"{path} missing from the API: {sorted(routes)}"
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "app", "main.py"), encoding="utf-8").read()
+    # /health must expose the fields that decide whether a headless host works at all
+    for field in ("browser_free", "session_source", "http_verified"):
+        assert f'"{field}"' in src, f"/health does not report {field}"
+    # a browser-free host must not be routed to the engine thread in _live()
+    assert "browserless" in src.split("def _live(")[1].split("def _stale(")[0], \
+        "_live() has no browser-free branch; it would still try the engine thread"
+    print("PASS  API exposes /trending; /health reports browser_free + session_source")
+
+
 if __name__ == "__main__":
     test_lru_claim_no_duplicates()
     test_cap_spill_is_rationed()
@@ -727,6 +819,9 @@ if __name__ == "__main__":
     test_idgap_uses_semaphore_gated_search()
     test_nat64_resolver_guard()
     test_resolver_guard_reraises_dns_failure()
+    test_browser_free_client_never_launches_a_browser()
+    test_browser_free_flag_is_read_from_env()
+    test_api_exposes_trending_and_reports_the_browser_free_verdict()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
     assert d.count(b"\x00") == 0, "ROT in idgap.py"

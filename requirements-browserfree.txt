@@ -1,0 +1,8 @@
+# Browser-free dependency set: requirements.txt minus camoufox / nodriver /
+# playwright. The API reaches mkvbase over plain HTTPS with curl_cffi, so a
+# browser runtime is dead weight -- and on a 512MB Render instance it is a liability.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+curl_cffi>=0.7
+pymongo>=4.6

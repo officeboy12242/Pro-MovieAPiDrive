@@ -1,0 +1,61 @@
+# Render Blueprint — free plan, LIVE-ORIGIN, BROWSER-FREE.
+#
+# This instance answers /search, /links, /recent and /trending by hitting mkvbase
+# itself over plain HTTPS. It never launches a browser: the image ships no browser
+# stack (Dockerfile.browserfree) and app/client.py refuses every browser path when
+# MKV_BROWSER_FREE=true, so a launch cannot even be attempted, let alone OOM-kill
+# the process on this 512MB plan.
+#
+# The session comes from the first of these that works:
+#   1. MKV_ORIGIN_KEY  — the site owner's Cloudflare skip-rule (no challenge at all).
+#   2. a cookieless IP  — a bare GET /api/links sets every mkv_* cookie unchallenged.
+#   3. a borrowed cf_clearance — the browser-capable host (home PC) publishes its
+#      cleared session to the MongoDB Atlas sessions collection; this instance reads it.
+# cf_clearance is IP-bound, so (3) only works if Cloudflare does not re-check it for
+# this egress IP. Read the verdict from GET /health -> session_source + http_verified:
+#   "nokey" or "origin-key"  = fully self-sufficient, no other host involved
+#   "shared"                = borrowing; works, but depends on the publisher
+#   null + http_verified=false = neither; /search answers 503 and you need MKV_PROXY
+#
+# Keepalive is ON so the free instance does not sleep between callers.
+services:
+  - type: web
+    name: pro-movieapidrive-live
+    runtime: docker
+    dockerfilePath: ./Dockerfile.browserfree
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: MKV_BROWSER_FREE
+        value: "true"       # no browser, ever: plain HTTPS only
+      - key: MKV_DATA_DIR
+        value: /tmp/data
+      # MongoDB Atlas: durable links index AND the shared session collection that
+      # browser-capable hosts publish their cf_clearance into. Set the real value in
+      # the Render dashboard, never in git. Same string the PC fleet uses.
+      - key: MKV_MONGODB_URI
+        sync: false
+      - key: MKV_CACHE_TTL
+        value: "60"         # live origin: short cache, more current answers
+      - key: MKV_KEEPALIVE
+        value: "true"
+      - key: MKV_HTTP_CONCURRENCY
+        value: "2"          # same CF-safe cap the crawler fleet runs
+      - key: MKV_HTTP_GAP_S
+        value: "0.4"
+      - key: MKV_REQUEST_WAIT
+        value: "15"
+      - key: MKV_WARM_TIMEOUT
+        value: "60"         # browser-free bootstrap is a couple of HTTP calls, not 300s
+      - key: MKV_BOOTSTRAP_TIMEOUT
+        value: "30"
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      # Optional owner skip-rule secret (removes the challenge entirely). Dashboard only.
+      - key: MKV_ORIGIN_KEY
+        sync: false
+      # Optional: residential proxy, only if /health shows session_source=null.
+      # Dashboard only.
+      - key: MKV_PROXY
+        sync: false
