@@ -68,7 +68,7 @@ def prefer_mongo_ipv4(force: bool | None = None) -> bool:
         try:
             got = real(host, port, *args, **kwargs)
         except Exception:
-            return got
+            raise  # never mask a DNS failure with an UnboundLocalError on `got`
         kept = [r for r in got
                 if r[0] != socket.AF_INET6 or (not force and not _is_nat64(r[4][0]))]
         return kept or got

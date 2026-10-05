@@ -554,6 +554,40 @@ def test_nat64_resolver_guard() -> None:
     print("PASS  NAT64 resolver guard: drops 64:ff9b::/96, keeps real A and AAAA, idempotent")
 
 
+def test_resolver_guard_reraises_dns_failure() -> None:
+    """A DNS failure must propagate, not become an UnboundLocalError on `got`.
+
+    The guard's except block used to do `return got` when the underlying
+    resolver raised -- but `got` is only assigned on success, so a DNS
+    timeout surfaced as 'UnboundLocalError: cannot access local variable
+    got' wrapped inside a ServerSelectionTimeoutError. Measured 2026-10-05
+    under concurrency 3: every idgap agent hit it and the fleet stalled.
+    """
+    import socket as sock
+    import app.store as store
+
+    def _boom(host, port, *a, **k):
+        raise OSError("DNS timeout (simulated)")
+
+    original = sock.getaddrinfo
+    store._ipv4_only_installed = False
+    sock.getaddrinfo = _boom
+    try:
+        store.prefer_mongo_ipv4()   # installs _filtered closing over _boom
+        try:
+            sock.getaddrinfo("example.com", 27017)
+            assert False, "DNS failure did not propagate"
+        except OSError as e:
+            assert "DNS timeout" in str(e), e
+        except UnboundLocalError:
+            assert False, "DNS failure masked as UnboundLocalError on 'got'"
+    finally:
+        sock.getaddrinfo = original
+        store._ipv4_only_installed = False
+        store.prefer_mongo_ipv4()   # restore the real guard
+    print("PASS  resolver guard: DNS failure propagates, not an UnboundLocalError")
+
+
 if __name__ == "__main__":
     test_lru_claim_no_duplicates()
     test_cap_spill_is_rationed()
@@ -570,6 +604,7 @@ if __name__ == "__main__":
     test_phrase_channel_serves_when_token_pool_is_empty()
     test_slice_channel_claims_each_slice_once()
     test_nat64_resolver_guard()
+    test_resolver_guard_reraises_dns_failure()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
     assert d.count(b"\x00") == 0, "ROT in idgap.py"
