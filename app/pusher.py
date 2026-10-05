@@ -71,7 +71,7 @@ class Seen:
 
 
 class Pusher:
-    TRENDING_EVERY = float(os.getenv("MKV_PUSHER_TRENDING_S", "1800"))
+    TRENDING_EVERY = float(os.getenv("MKV_PUSHER_TRENDING_S", "1200"))
 
     def __init__(self, render_url: str, sync_key: str, client: MkvbaseClient, state_dir: str):
         self.render = render_url.rstrip("/")
