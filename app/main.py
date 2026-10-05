@@ -35,11 +35,6 @@ start_keepalive()
 _SYNC_KEY = os.getenv("MKV_SYNC_KEY", "")
 # Serve-only mode: /search and /recent never live-scrape, only serve synced/saved results.
 _SERVE_ONLY = os.getenv("MKV_SERVE_ONLY", "").lower() in ("1", "true", "yes")
-# Live-origin mode: hit mkvbase directly over plain HTTPS from this host, with no
-# browser ever. Works on 512MB (Render free) when the session can be obtained without
-# a clearance: the owner skip-rule (MKV_ORIGIN_KEY), a cookieless/unchallenged IP, or
-# a cf_clearance borrowed from a browser-capable host via the shared Mongo store.
-# Set on the client in _get_client; read by /live/_startup for reporting.
 _DATA_DIR = os.getenv("MKV_DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
 # Longest a request waits for the warmer before answering from stale data or 503.
 _REQUEST_WAIT_S = float(os.getenv("MKV_REQUEST_WAIT", "25"))
@@ -123,7 +118,7 @@ def _reset_engine() -> int:
     old, _engine_pool = _engine_pool, ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine")
     old.shutdown(wait=False, cancel_futures=True)
     if _client is not None:
-        _client._engine = None if _client.browserless else make_engine()
+        _client._engine = make_engine()
     return killed
 
 
@@ -138,12 +133,8 @@ def _get_client() -> MkvbaseClient:
     global _client
     with _client_lock:
         if _client is None:
-            browser_free = os.getenv("MKV_BROWSER_FREE", "").lower() in ("1", "true", "yes")
-            # Browser-free hosts (512MB Render, and the browser-free image ships no
-            # browser deps) must not even build an engine: make_engine() raises when no
-            # engine package is installed, and a real launch would be OOM-killed.
-            engine = None if browser_free else make_engine()
-            _client = MkvbaseClient(engine, cache_path=os.path.join(_DATA_DIR, "search"))
+            # engine construction is lazy (no browser yet), so any thread may build it
+            _client = MkvbaseClient(make_engine(), cache_path=os.path.join(_DATA_DIR, "search"))
     return _client
 
 
@@ -202,20 +193,12 @@ class Warmer:
         self._started = time.time()
         self.attempts += 1
         try:
-            got = _run_on_engine(client.ensure_session, timeout=_WARM_TIMEOUT_S)
-            if got is False:
-                # ensure_session returning False means every bootstrap path failed.
-                # Marking it "ready" here used to hide that; treat it as a failure so
-                # /health and the 503 body tell the truth.
-                self._failed(f"no session available (source={client.session_source}, "
-                             f"browser_free={client.browserless})")
-                return
+            _run_on_engine(client.ensure_session, timeout=_WARM_TIMEOUT_S)
             self.state, self.fails, self.last_error = "ready", 0, None
             self.last_ok = time.time()
             self._ready.set()
             print(f"[warmer] session ready in {time.time() - self._started:.1f}s "
-                  f"(source={client.session_source}, "
-                  f"plain HTTP {'ok' if client.http_verified else 'blocked, browser mode'})", flush=True)
+                  f"(plain HTTP {'ok' if client.http_verified else 'blocked, browser mode'})", flush=True)
         except FutureTimeout:
             phase = _browser_phase()
             killed = _reset_engine()
@@ -269,15 +252,6 @@ def _live(fetch_http, fetch_browser):
     for attempt in range(2):
         try:
             if _warmer.http_ok is False:
-                # Browser-free hosts must never take the engine thread: there is no
-                # browser to fall back to, and _fetch would refuse anyway. Retry plain
-                # HTTP once (the warmer may have borrowed a fresh clearance), then raise.
-                if _client is not None and _client.browserless:
-                    if attempt:
-                        raise NeedsSession("browser-free host: plain HTTP still blocked")
-                    _warmer.kick()
-                    _warmer.wait_ready(min(_REQUEST_WAIT_S, 5.0))
-                    continue
                 return _run_on_engine(fetch_browser, timeout=_REQUEST_WAIT_S)
             return fetch_http()
         except NeedsSession:
@@ -360,9 +334,6 @@ def health():
     return {"ok": True, "uptime_s": round(time.time() - _BOOT), "engine": os.getenv("MKV_ENGINE", "auto"),
             "client_engine": _client.engine_name if _client else "not-init",
             "session": sess,
-            "browser_free": _client.browserless if _client else None,
-            "session_source": _client.session_source if _client else None,
-            "http_verified": _client.http_verified if _client else None,
             "warmer": _warmer.status(),
             "browser_open": _client.browser_open if _client else False,
             "mem_mb": _mem_mb(),
@@ -492,40 +463,6 @@ def recent(save: bool = True):
     if save:
         Store(_DATA_DIR).record("recent", "latest", obj)
     return obj
-
-
-@app.get("/trending")
-def trending():
-    """GET /api/trending straight from mkvbase: the titles people are searching right
-    now (found in the site's own client bundle). Unsigned, ~0.7s over plain HTTPS.
-    Also served from the last snapshot when the origin is unreachable, so a
-    browser-free host still answers instead of 503-ing."""
-    client = _get_client()
-    t0 = time.time()
-    titles: list[str] = []
-    reason = None
-    if not _SERVE_ONLY:
-        try:
-            titles = client.recent_trending()
-            if not titles:
-                reason = "origin returned no trending titles"
-        except Exception as e:
-            reason = f"{type(e).__name__}: {e}"
-    out: dict = {"count": len(titles), "took_ms": int((time.time() - t0) * 1000),
-                 "results": titles, "source": "origin" if titles else "none"}
-    if titles:
-        _cache_put("_trending", {"results": titles})
-        return out
-    stale = _cache_get("_trending", max_age=None)
-    if stale:
-        return {**out, "source": "stale", "cached": True, "stale": True,
-                "age_s": round(time.time() - stale[0], 1),
-                "reason": reason or "serve-only mode", "results": stale[1].get("results", [])}
-    raise HTTPException(status_code=503, detail={
-        "error": "trending unavailable on this host",
-        "reason": reason or ("serve-only mode" if _SERVE_ONLY else "origin empty"),
-        "session_source": client.session_source,
-        "browser_free": client.browserless})
 
 
 @app.get("/saved")
