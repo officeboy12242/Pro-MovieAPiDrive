@@ -1114,6 +1114,12 @@ class IdGapMiner:
                                      else self._term_kind(term)))
         t0 = time.time()
         try:
+            # client.search() is ALREADY http-first (client.py _fetch tries
+            # plain HTTP before the browser), and it holds the _http_sem
+            # permit. Do NOT call search_http() here: it bypasses that
+            # semaphore and would let the miners stampede past the
+            # MKV_HTTP_CONCURRENCY cap. Measured 2026-10-05: search_http and
+            # search are indistinguishable (3.24s vs 3.15s over 3 terms).
             obj = self.client.search(term)
         except Exception as e:
             self.searched_terms[term] = time.time() - 18 * 3600  # retry sooner
