@@ -81,10 +81,15 @@ _SLICE_SEASON_CAP = 32000   # ...of which at most this many are season slices
 _SLICE_QUEUE_CAP = 500      # bounded self-feed queue (mirrors _spill_queue)
 _SLICE_SEASON_HI = 40       # per-show season expansion bound (junk guard)
 _SLICE_EP_HI = 12           # per-season episode expansion bound
-# Facet-qualified season slices: 'show sNN hindi' is a DIFFERENT query from
-# 'show sNN' -- it returns the newest 50 rows matching all three tokens, a set
-# the bare season slice never reaches. Bare slices are measured mined out
-# (0 new); facet slices are unsearched and reach older, unvaulted rows.
+# Facet-qualified season slices are ONLY minted from capped (>=50-row)
+# results via the self-feed queue, never upfront in the pool. Rationale
+# (site semantics): a query with <=50 total matches returns its COMPLETE
+# set, so an uncapped bare slice already surfaced everything; its facet
+# sub-slices are subsets (0 new, pure waste). Only a capped bare slice
+# (50 rows) hides rows below the cap, so only capped shows earn facet
+# sub-slices. Measured 2026-10-05: faceted-upfront yielded 0.337/search
+# decaying to 0.00 in mined regions with 5x 0-row waste per barren season;
+# bare-first with capped-triggered faceting restores hit rate.
 _SLICE_FACETS = ("hindi", "1080p", "720p", "esub", "mkv")
 import re as _re
 
@@ -353,6 +358,24 @@ class IdGapMiner:
         with self._lock:
             try:
                 os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+                # Prune expired searched_terms (older than TTL) before dump.
+                # Rationale: the file had grown to 102k entries / 4.2MB,
+                # rewritten after EVERY step, holding the lock during dump.
+                # Pruning keeps saves fast and lets the pool rebuild re-include
+                # expired terms for TTL re-sweep (new uploads since last search).
+                # TTL check (now - ts > ttl) treats pruned terms as retryable,
+                # which is exactly the intended TTL semantics. Atomicity and
+                # corrupt-quarantine below are unchanged.
+                try:
+                    ttl = float(self.term_ttl_s)
+                except Exception:
+                    ttl = 3 * 3600
+                now = time.time()
+                st = self.searched_terms
+                if len(st) > 20000:
+                    self.searched_terms = {
+                        k: v for k, v in st.items() if now - float(v) <= ttl
+                    }
                 payload = {"done_blocks": sorted(self.done_blocks)[-500:],
                            "searched_terms": self.searched_terms,
                            "term_stats": self.term_stats,
@@ -808,7 +831,6 @@ class IdGapMiner:
             searched = self.searched_terms
         multi: list[tuple[str, str]] = []   # >=2 held seasons: proven catalog depth
         single: list[tuple[str, str]] = []  # 1 held season: s01 first (scam-1992 shape)
-        faceted: list[tuple[str, str]] = []  # season+facet: the new supply
         eps: list[tuple[str, str]] = []
         for h in sorted(shows):
             ss = shows[h]
@@ -826,18 +848,16 @@ class IdGapMiner:
                 t = f"{h} s{s:02d}"
                 if t not in searched:
                     dest.append((t, "slice-season"))
-                # Facet-qualified season slices: a different query reaching a
-                # different (older) result set than the bare season slice.
-                for f in _SLICE_FACETS:
-                    t2 = f"{h} s{s:02d} {f}"
-                    if t2 not in searched:
-                        faceted.append((t2, "slice-season"))
+                # NOTE: no faceted-upfront here. Facet sub-slices are minted
+                # ONLY from capped (>=50-row) results via _drain_slice_hits:
+                # uncapped bare slices already returned their complete set,
+                # so upfront faceting is 5x 0-row waste per barren season.
         # s01 of every single-season show outranks their s05: lower seasons
         # exist more often, and unsearched s01 slices measured 16 new/search.
         single.sort(key=lambda tk: (int(tk[0].rsplit(" ", 1)[-1][1:]), tk[0]))
-        # Faceted slices lead: bare season slices are measured mined out
-        # (0 new), so the unsearched facet-qualified slices are the new supply.
-        season = faceted + multi + single
+        # Bare seasons first: highest hit rate (3.11/search prime). Facets
+        # arrive via the capped-triggered self-feed queue, not the pool.
+        season = multi + single
         for h in sorted(shows, key=lambda h: (-len(shows[h]), h)):
             for s in sorted(shows[h]):
                 top = min(max(epmax.get((h, s), 6), 6), _SLICE_EP_HI)

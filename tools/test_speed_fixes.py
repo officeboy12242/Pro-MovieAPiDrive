@@ -407,6 +407,35 @@ def test_save_is_atomic_and_corrupt_load_is_loud() -> None:
     print("PASS  state save is atomic (tmp+replace); corrupt load is quarantined+reported")
 
 
+def test_save_prunes_expired_searched_terms() -> None:
+    """save() must prune searched_terms older than TTL when the dict is big.
+
+    Live state had grown to 102k entries / 4.2MB, rewritten after EVERY
+    step while holding the lock. Pruning keeps saves fast and lets the
+    pool rebuild re-include expired terms for TTL re-sweep (new uploads).
+    Small dicts (<20k) are untouched so existing behavior is preserved.
+    """
+    import tempfile
+    m = make_miner()
+    tmpdir = tempfile.mkdtemp(prefix="idgap_state_")
+    m.state_path = os.path.join(tmpdir, "idgap_state.json")
+    del m.save
+    m.done_blocks = set()
+    m.round_started = 0.0
+    now = time.time()
+    m.searched_terms = (
+        {f"old{i}": now - 4 * 3600 for i in range(20005)}
+        | {"fresh": now}
+    )
+    m.save()
+    saved = json.load(open(m.state_path, encoding="utf-8"))
+    assert "fresh" in saved["searched_terms"], "fresh entry pruned"
+    assert len(saved["searched_terms"]) < 20006, "expired entries not pruned"
+    assert all(now - float(v) <= m.term_ttl_s + 1
+              for v in saved["searched_terms"].values()), "stale entry survived"
+    print("PASS  save prunes expired searched_terms, keeps state small")
+
+
 def test_phrase_channel_serves_when_token_pool_is_empty() -> None:
     """The single-token pool is exhausted (174 left, mostly typo spam), so the
     miner must fall through to two-word phrases -- and only clean, never-searched
@@ -521,11 +550,16 @@ def test_slice_selffeed_no_degenerate_chains() -> None:
 
 
 def test_slice_pool_has_faceted_season_slices() -> None:
-    """The slice pool must include facet-qualified season slices, leading it.
+    """The slice pool leads with BARE season slices; facets arrive only via
+    capped-triggered self-feed, never upfront.
 
-    Bare 'show sNN' slices are measured mined out (0 new rows). The pool
-    adds 'show sNN facet' slices (hindi/1080p/720p/esub/mkv) -- different
-    queries reaching older, unvaulted rows -- and they lead the pool.
+    Rejected strategy (measured 2026-10-05): faceted-upfront yielded
+    0.337/search decaying to 0.00 in mined regions, with 5x 0-row waste per
+    barren season (every facet of a nonexistent season returns 0 rows).
+    Site semantics: <=50 matches returns the COMPLETE set, so an uncapped
+    bare slice already surfaced everything; its facet sub-slices are
+    subsets (0 new). Only capped (>=50-row) bare slices hide rows below
+    the cap, so only they earn facet sub-slices via _drain_slice_hits.
     """
     class _Col:
         def __init__(self, titles):
@@ -543,8 +577,8 @@ def test_slice_pool_has_faceted_season_slices() -> None:
     n = m._build_slice_pool()
     pool = [t for t, _ in m._slice_pool]
     assert n > 0, "pool build returned nothing"
-    assert any(t.endswith(" s01 hindi") for t in pool), f"no faceted s01: {pool[:5]}"
-    assert any(t.endswith(" s02 1080p") for t in pool), f"no faceted s02: {pool[:5]}"
+    assert any(t == "show s01" for t in pool), f"no bare s01: {pool[:5]}"
+    assert any(t == "show s02" for t in pool), f"no bare s02: {pool[:5]}"
 
     def is_bare(t):
         p = t.split(" ")
@@ -554,10 +588,10 @@ def test_slice_pool_has_faceted_season_slices() -> None:
         p = t.split(" ")
         return len(p) == 3 and p[1].startswith("s")
 
-    first_bare = next((i for i, t in enumerate(pool) if is_bare(t)), len(pool))
-    first_faceted = next((i for i, t in enumerate(pool) if is_faceted(t)), len(pool))
-    assert first_faceted < first_bare, f"faceted must lead: pool[:6]={pool[:6]}"
-    print(f"PASS  slice pool: {n} slices, faceted season slices lead")
+    assert not any(is_faceted(t) for t in pool), \
+        f"faceted-upfront must be gone (capped-triggered only): {pool[:6]}"
+    assert any(is_bare(t) for t in pool), f"bare seasons missing: {pool[:6]}"
+    print(f"PASS  slice pool: {n} bare season slices, facets capped-triggered only")
 
 
 def test_season_slices_outrank_head_facet() -> None:
@@ -684,6 +718,7 @@ if __name__ == "__main__":
     test_token_sweep_only_claims_uncapped_tokens()
     test_token_frontier_is_recursive_and_rationed()
     test_save_is_atomic_and_corrupt_load_is_loud()
+    test_save_prunes_expired_searched_terms()
     test_phrase_channel_serves_when_token_pool_is_empty()
     test_slice_channel_claims_each_slice_once()
     test_slice_selffeed_no_degenerate_chains()
