@@ -71,8 +71,8 @@ index; `GET /health` → `links: {rows, ...}` shows the total.
   Cloudflare zone: WAF skip-rule for a secret header (see below), set
   `MKV_ORIGIN_KEY` on Render, unset `MKV_SERVE_ONLY`. Live scraping on Render
   itself, ~200MB RAM.
-- **Oracle Always Free ARM VM (up to 24GB, $0)** — `deploy/oracle-setup.sh` +
-  `deploy/oracle-push.ps1` are ready; runs the whole thing including browser.
+- **Oracle Always Free ARM VM (up to 24GB, $0)** — `deploy/oracle-crawler.sh`
+  is ready; runs the whole thing including browser.
 - **Bigger Render plan** — Standard 2GB ($25/mo) runs the browser comfortably,
   though a datacenter IP may still be challenged harder by Cloudflare.
 
