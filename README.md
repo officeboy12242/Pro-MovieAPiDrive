@@ -73,6 +73,10 @@ index; `GET /health` → `links: {rows, ...}` shows the total.
   itself, ~200MB RAM.
 - **Oracle Always Free ARM VM (up to 24GB, $0)** — `deploy/oracle-crawler.sh`
   is ready; runs the whole thing including browser.
+- **Oracle E2 Micro (1GB, $0) as borrower** — `deploy/oracle-micro.sh` is
+  ready; too small to clear Cloudflare itself, so it borrows the cleared
+  session from Mongo (published by your PC/phone fleet) and mines over
+  plain HTTP. Keep one browser-capable publisher running.
 - **Bigger Render plan** — Standard 2GB ($25/mo) runs the browser comfortably,
   though a datacenter IP may still be challenged harder by Cloudflare.
 
