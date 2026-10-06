@@ -308,9 +308,10 @@ class LinksIndex:
 
     # ------------------------------------------------------------------ read
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
-        """Newest-first rows (file order is insertion order), optionally filtered
-        exactly like the mkvbase site search: every query token must appear
-        in the title, case-insensitive, punctuation as a separator."""
+        """Newest site pushes first (created_at is the site upload time,
+        insertion order the tiebreak), optionally filtered exactly like
+        the mkvbase site search: every query token must appear in the
+        title, case-insensitive, punctuation as a separator."""
         with self._lock:
             self._hits += 1
             rows = list(self._rows.values())
@@ -318,6 +319,9 @@ class LinksIndex:
         tokens = _site_tokens(q)
         if tokens:
             rows = [r for r in rows if _site_title_match(r.get("title") or "", tokens)]
+        # Newest site pushes first (created_at is the site's upload time);
+        # insertion order is the tiebreak. Stable sort keeps it for ties.
+        rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
         return {"count": len(rows), "results": rows[:max(0, limit)]}
 
     def stats(self) -> dict:
@@ -350,6 +354,9 @@ class MongoIndex:
         self._col.create_index("_seq")  # first-seen order, for newest-first paging
         self._col.create_index("title_tokens")  # whole-token AND search
         self._col.create_index("id")  # idgap block math + max-id lookups
+        # /recent orders by the site's own upload time; index it so the
+        # unfiltered newest-first scan doesn't sort 385k docs in memory.
+        self._col.create_index([("created_at", -1)])
         self._backfill_title_tokens()
         self._hits = 0
         # --- overflow shard (cluster B) -------------------------------
@@ -373,6 +380,7 @@ class MongoIndex:
                 self._col2.create_index("_seq")
                 self._col2.create_index("title_tokens")
                 self._col2.create_index("id")
+                self._col2.create_index([("created_at", -1)])
                 self._col2.estimated_document_count()  # fail fast if unreachable
                 print(f"[index] overflow shard armed: ids >= {self._overflow_min} "
                       f"-> secondary cluster", flush=True)
@@ -529,9 +537,9 @@ class MongoIndex:
                         updated += 1
         return new, updated
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
-        """Newest-discovered-first rows, filtered exactly like the mkvbase
-        site search: every query token must appear in the title, with
-        punctuation as a separator. Backed by the title_tokens multikey
+        """Newest site pushes first (created_at), filtered exactly like the
+        mkvbase site search: every query token must appear in the title,
+        with punctuation as a separator. Backed by the title_tokens multikey
         index ($all) — exact at any scale, no fetch window."""
         self._hits += 1
         tokens = list({t.lower() for t in _site_tokens(q)})
@@ -540,10 +548,25 @@ class MongoIndex:
         total, merged = 0, []
         for col in self.cols():
             total += col.count_documents(query)
-            merged.extend(col.find(query, proj).sort("_seq", self._DESC)
+            # Newest site pushes first: created_at is the site's own upload
+            # timestamp. _seq (first-discovered) is the tiebreak, so rows the
+            # crawler re-discovered today do not leapfrog fresh uploads.
+            merged.extend(col.find(query, proj)
+                          .sort([("created_at", self._DESC), ("_seq", self._DESC)])
                           .limit(max(0, limit)))
-        merged.sort(key=lambda r: r.get("_seq") or 0, reverse=True)
-        rows = merged[:max(0, limit)]
+        merged.sort(key=lambda r: (str(r.get("created_at") or ""),
+                                   r.get("_seq") or 0), reverse=True)
+        # the same site id can live in both clusters (written before the
+        # overflow shard took over, then re-upserted there); serve it once.
+        # The total stays the cross-shard count (slight overcount from
+        # that overlap), since deduping a count would need a full scan.
+        seen, unique = set(), []
+        for r in merged:
+            key = _row_key(r)
+            if key is None or key not in seen:
+                seen.add(key)
+                unique.append(r)
+        rows = unique[:max(0, limit)]
         for r in rows:
             r.pop("_seq", None)
         return {"count": total, "results": rows}

@@ -794,6 +794,41 @@ def test_links_index_serves_the_kuroko_pack() -> None:
     print("PASS  file index: all 6 pack rows served for 'Kuroko' and variants")
 
 
+def test_recent_orders_by_site_upload_time() -> None:
+    """/recent must mirror the site's front page, not the crawler's
+    discovery order. 2026-10-06: the top of /recent was four rows of
+    'How Are You Feroz' (site uploads 2025-11-16) that the miner
+    happened to re-surface that morning — their legacy rows had no
+    _seq, so the upsert stamped them with 'now' and they leapfrogged
+    every real new push. Ordering by created_at fixes the feed."""
+    import tempfile
+    from app.store import LinksIndex
+
+    rows = [
+        # inserted FIRST, but the OLDEST site upload
+        {"id": 100, "title": "Old Film 2025", "url": "u100",
+         "created_at": "2025-11-16T04:20:35+00:00", "status": "1"},
+        # genuinely newest site push
+        {"id": 300, "title": "New Push 2026", "url": "u300",
+         "created_at": "2026-10-06T15:08:46+00:00", "status": "1"},
+        {"id": 200, "title": "Mid Film 2026", "url": "u200",
+         "created_at": "2026-10-06T15:00:12+00:00", "status": "1"},
+        # legacy row with no created_at at all -> sinks to the bottom
+        {"id": 400, "title": "No Timestamp Row", "url": "u400",
+         "status": "1"},
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        idx = LinksIndex(td)
+        idx.upsert(rows, source="recent")
+        out = idx.recent(limit=10)
+        order = [r["id"] for r in out["results"]]
+        assert order == [300, 200, 100, 400], order
+        # filtering applies the same ordering
+        out2 = idx.recent(limit=10, q="film")
+        assert [r["id"] for r in out2["results"]] == [200, 100], out2
+    print("PASS  /recent serves newest site pushes first (created_at)")
+
+
 def test_mongo_doc_tokens_use_the_shared_tokenizer() -> None:
     """The Mongo backend stores title_tokens at upsert time; those
     arrays must be built by the same tokenizer as the query side or
@@ -835,6 +870,7 @@ if __name__ == "__main__":
     test_resolver_guard_reraises_dns_failure()
     test_apostrophe_titles_are_searchable()
     test_links_index_serves_the_kuroko_pack()
+    test_recent_orders_by_site_upload_time()
     test_mongo_doc_tokens_use_the_shared_tokenizer()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
