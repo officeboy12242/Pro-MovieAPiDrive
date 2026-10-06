@@ -18,17 +18,8 @@ echo [AUTOSTART] at logon
 if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mkvbase-autostart.cmd" (echo   ENABLED  - fleet starts by itself at every logon) else if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mkvbase-autostart.cmd.disabled" (echo   disabled - won't start at logon) else (echo   not installed)
 
 echo.
-if exist .venv\Scripts\python.exe (
-  .venv\Scripts\python.exe _status.py 2>nul
-) else (
-  python _status.py 2>nul
-)
-if errorlevel 1 echo   (status details failed to load - check .venv)
-
-echo.
 echo ============================================================
 echo   START: START-auto-everything.cmd     STOP: STOP-all-crawlers.cmd
 echo   (also: start-crawler.cmd / STOP-local-crawler.cmd)
-echo   SEARCH: search.cmd                   TEST: _check_series_agent.py
 echo ============================================================
 pause

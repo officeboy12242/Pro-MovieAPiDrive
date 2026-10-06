@@ -616,7 +616,10 @@ def _push_render(term: str, rows: list[dict]) -> str:
 
 
 def _do_manual_search(term: str) -> dict:
-    """Same flow as _search.py: crawl the term with the shared Cloudflare
+    """Crawl the term with the shared Cloudflare session: signed
+    searches over plain HTTPS, upserting every row into the index.
+    Same flow the pusher's manual-search tick uses.
+
     session, vault rows (shard-aware), push to Render. Runs in a thread."""
     from app.client import MkvbaseClient, NeedsSession
     from app.store import make_index
