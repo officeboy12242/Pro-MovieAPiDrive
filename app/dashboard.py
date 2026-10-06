@@ -151,9 +151,18 @@ def _newest(col, n: int = 12) -> list[dict]:
         return []
     try:
         out = []
+        seen: set = set()
         for c in cols:
             for r in c.find({}, {"id": 1, "title": 1, "_src": 1, "created_at": 1}
                             ).sort("_seq", -1).limit(n):
+                # The same site id can sit in BOTH clusters (written before
+                # the overflow shard took over, then re-upserted there). The
+                # old merge showed it twice, and Alpine's x-for with
+                # :key="x.id" then refuses to render the panel at all.
+                key = r.get("id") if r.get("id") is not None else r.get("_id")
+                if key in seen:
+                    continue
+                seen.add(key)
                 out.append({"id": r.get("id"), "title": (r.get("title") or "")[:90],
                             "src": (r.get("_src") or "").split(":")[0],
                             "created_at": (r.get("created_at") or "")[:10]})
