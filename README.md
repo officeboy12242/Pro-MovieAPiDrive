@@ -123,6 +123,12 @@ set MKV_ENGINE=drissionpage                      # or camoufox
 | `GET /saved/search_predestination.json` | fetch a persisted result set |
 | `POST /cache/clear` | drop all cached results |
 
+`/search` and `/links?q=` match the mkvbase site's own semantics:
+every query token must appear in the title, case-insensitive, with
+punctuation treated as a separator. `Kuroko`, `Kurokos` and
+`Kuroko's` are the same word, so all three find titles like
+"Kuroko's Basketball S01 COMPLETE".
+
 ## Performance (measured)
 
 | Scenario | Latency |

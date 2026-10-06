@@ -705,6 +705,112 @@ def test_resolver_guard_reraises_dns_failure() -> None:
     print("PASS  resolver guard: DNS failure propagates, not an UnboundLocalError")
 
 
+def test_apostrophe_titles_are_searchable() -> None:
+    """Punctuation is a token separator on the mkvbase site, so
+    'Kuroko's Basketball' must be findable as 'Kuroko', 'Kurokos'
+    or "Kuroko's" alike.
+
+    Measured 2026-10-06: the index held 65 Kuroko rows but
+    /links?q=Kuroko answered 4, because 'Kuroko's' indexed as the
+    single token "kuroko's" and a bare 'Kuroko' query could never
+    match it. 'Kuroko Basketball S01 COMPLETE' answered 0 rows even
+    though the vault holds all 6 rows the site serves for it.
+    """
+    from app.store import _site_tokens, _site_title_match
+
+    title = ("Kuroko's Basketball S01 COMPLETE 1080p 10bit BluRay "
+             "HEVC x265 [Hindi AMZN DDP 2 0]")
+
+    # the query tokenizer produces every spelling of the head word
+    toks = _site_tokens("Kuroko")
+    assert toks == ["kuroko"], toks
+    head = _site_tokens("Kuroko's Basketball")
+    for want in ("kuroko", "s", "kurokos", "basketball"):
+        assert want in head, f"{want} missing from {head}"
+
+    # ... and every one of them finds the apostrophe title
+    for q in ("Kuroko", "Kurokos", "Kuroko's", "Kuroko s",
+              "Kuroko Basketball", "Kurokos Basketball",
+              "Kuroko's Basketball S01 COMPLETE",
+              "Kuroko Basketball S01 COMPLETE"):
+        assert _site_title_match(title, _site_tokens(q)), f"{q!r} missed the pack"
+
+    # non-alphanumeric words still never match (site behaviour:
+    # 'Kurokos Basketball S01 COMPLETE' returns 0 on the site itself
+    # because the pack's head token is the apostrophe form)
+    assert not _site_title_match(
+        "Kurokos Basketball S01 1080p AMZN WEB DL",
+        _site_tokens("Kuroko Basketball S01")), \
+        "bare 'Kuroko' must not match the unspaced 'Kurokos' title"
+
+    # ordinary titles are unchanged by the new tokenizer
+    plain = "Paathirathri 2025 2160p ZEE5 WEB DL"
+    assert _site_title_match(plain, _site_tokens("zee5 paathirathri"))
+    assert _site_title_match(plain, _site_tokens("paathirathri  web dl"))
+    assert not _site_title_match(plain, _site_tokens("paathirathi"))
+    assert not _site_title_match(plain, _site_tokens("gdflix.dev"))
+
+    # whitespace-only query = no filter
+    assert _site_tokens("   ") == []
+    assert _site_title_match(plain, _site_tokens("   "))
+    print("PASS  apostrophe/punctuation titles searchable under every spelling")
+
+
+def test_links_index_serves_the_kuroko_pack() -> None:
+    """End-to-end through the file backend: the exact rows the site
+    serves for 'Kuroko's Basketball S01 COMPLETE' must come back for
+    the apostrophe-free query the user actually types."""
+    import tempfile
+    from app.store import LinksIndex
+
+    pack = [{"id": 538587 + i,
+             "title": ("Kuroko's Basketball S01 COMPLETE 1080p 10bit "
+                       "BluRay HEVC x265 [Hindi AMZN DDP 2 0 + English]"),
+             "url": f"https://example.com/{538587 + i}",
+             "created_at": "2026-10-06T00:00:00Z", "status": "1"}
+            for i in range(6)]
+    episodes = [{"id": 461766,
+                 "title": "Kurokos Basketball S01E03 Its Better If I Cant Win "
+                          "1080p AMZN WEB DL Hindi DDP2 0",
+                 "url": "https://example.com/461766",
+                 "created_at": "2026-10-01T00:00:00Z", "status": "1"}]
+
+    with tempfile.TemporaryDirectory() as td:
+        idx = LinksIndex(td)
+        new, _ = idx.upsert(pack + episodes, source="search")
+        assert new == 7, new
+
+        for q, want in (("Kuroko", 6), ("Kurokos", 7),
+                        ("Kuroko Basketball S01 COMPLETE", 6),
+                        ("Kuroko's Basketball S01 COMPLETE", 6),
+                        ("Kuroko Basketball", 6),
+                        ("Kurokos Basketball S01", 6)):
+            out = idx.recent(limit=1000, q=q)
+            assert out["count"] == want, f"{q!r}: {out['count']} != {want}"
+        # the joined form means the unspelled-out query finds the pack
+        # too (the site itself returns 0 here — its own apostrophe
+        # quirk; our index being more permissive is the point)
+        assert idx.recent(limit=10, q="Kurokos Basketball S01 COMPLETE")["count"] == 6
+    print("PASS  file index: all 6 pack rows served for 'Kuroko' and variants")
+
+
+def test_mongo_doc_tokens_use_the_shared_tokenizer() -> None:
+    """The Mongo backend stores title_tokens at upsert time; those
+    arrays must be built by the same tokenizer as the query side or
+    $all matches the wrong thing."""
+    from app.store import MongoIndex, _site_tokens
+
+    doc = MongoIndex._doc({"id": 1, "title": "Kuroko's Basketball S01 "
+                                              "COMPLETE 1080p",
+                           "url": "u", "created_at": "c", "status": "1"},
+                          "search", 1.0)
+    assert set(doc["title_tokens"]) == set(_site_tokens(
+        "Kuroko's Basketball S01 COMPLETE 1080p")), doc["title_tokens"]
+    for want in ("kuroko", "kurokos", "basketball", "s01", "complete"):
+        assert want in doc["title_tokens"], f"{want} missing"
+    print("PASS  Mongo title_tokens built by the shared tokenizer")
+
+
 if __name__ == "__main__":
     test_lru_claim_no_duplicates()
     test_cap_spill_is_rationed()
@@ -727,6 +833,9 @@ if __name__ == "__main__":
     test_idgap_uses_semaphore_gated_search()
     test_nat64_resolver_guard()
     test_resolver_guard_reraises_dns_failure()
+    test_apostrophe_titles_are_searchable()
+    test_links_index_serves_the_kuroko_pack()
+    test_mongo_doc_tokens_use_the_shared_tokenizer()
     d = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "app", "idgap.py"), "rb").read()
     assert d.count(b"\x00") == 0, "ROT in idgap.py"

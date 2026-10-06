@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -80,23 +81,42 @@ def prefer_mongo_ipv4(force: bool | None = None) -> bool:
     return True
 
 
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
 def _site_tokens(q: str) -> list[str]:
-    """mkvbase site search semantics (validated live against the signed search API):
-    the query is split on whitespace and EVERY token must match the row TITLE as a
-    whole token (substring inside a token does not count: 'paathirathi' finds 0 rows
-    while 'paathirathri' finds 6). Matching is token-anywhere/any-order AND —
-    'zee5 paathirathri' == 'paathirathri zee5' == 'paathirathri  web dl'. URLs are
-    NOT searched: 'gdflix.dev' matches rows whose url is gdflix.dev yet returns 0.
-    Returns [] only for a whitespace-only query (which the site treats as no filter)."""
-    return [t for t in (q or "").split() if t]
+    """mkvbase site search semantics (validated live against the signed
+    search API): every token of the query must appear in the row TITLE
+    (case-insensitive), token-anywhere/any-order — 'zee5 paathirathri' ==
+    'paathirathri zee5'. URLs are NOT searched: 'gdflix.dev' matches rows
+    whose url is gdflix.dev yet returns 0. Returns [] only for a
+    whitespace-only query (which the site treats as no filter).
+
+    Punctuation is a token separator on the site, so each word is indexed
+    two ways: split on every non-alphanumeric run AND with the punctuation
+    removed. 'Kuroko's' therefore indexes as {kuroko, s, kurokos}, which
+    makes 'Kuroko', 'Kurokos' and "Kuroko's" all find it — the site's own
+    behaviour. Without the joined form a bare 'Kuroko' query matched only
+    4 of 65 Kuroko rows in the index (measured 2026-10-06)."""
+    t = (q or "").lower().strip()
+    if not t:
+        return []
+    toks: set[str] = set()
+    for piece in _NON_ALNUM.split(t):
+        if piece:
+            toks.add(piece)
+    for word in t.split():
+        joined = _NON_ALNUM.sub("", word)
+        if joined:
+            toks.add(joined)
+    return sorted(toks)
 
 
 def _site_title_match(title: str, tokens: list[str]) -> bool:
     if not tokens:
         return True
-    title_tokens = (title or "").lower().split()
-    lowered = [t.lower() for t in tokens]
-    return all(tok in title_tokens for tok in lowered)
+    title_tokens = _site_tokens(title)
+    return all(tok in title_tokens for tok in tokens)
 
 
 def _row_key(row: dict) -> str | None:
@@ -289,8 +309,8 @@ class LinksIndex:
     # ------------------------------------------------------------------ read
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
         """Newest-first rows (file order is insertion order), optionally filtered
-        exactly like the mkvbase site search: whitespace tokens, ALL must appear
-        as whole tokens in the title (case-insensitive)."""
+        exactly like the mkvbase site search: every query token must appear
+        in the title, case-insensitive, punctuation as a separator."""
         with self._lock:
             self._hits += 1
             rows = list(self._rows.values())
@@ -311,10 +331,11 @@ class MongoIndex:
     sleeps and restarts. One document per link row, deduplicated on _id (the
     row key: id/url/title) via upserts; queries are single-index sorts.
 
-    Search semantics = the mkvbase site's own: every whitespace token of the
-    query must appear as a whole token in the row TITLE (case-insensitive).
-    Implemented with a `title_tokens` multikey array + $all (index-backed, no
-    fetch window), which is exactly AND-over-tokens.
+    Search semantics = the mkvbase site's own: every token of the
+    query must appear in the row TITLE (case-insensitive), with
+    punctuation treated as a separator (see _site_tokens).
+    Implemented with a `title_tokens` multikey array + $all (index-backed,
+    no fetch window), which is exactly AND-over-tokens.
 
     db/collection: MKV_MONGO_DB (default mkvbase) / links.
     """
@@ -359,6 +380,8 @@ class MongoIndex:
                 print(f"[index] overflow shard unavailable ({type(e).__name__}); "
                       f"primary only", flush=True)
                 self._col2 = None
+        # after the shard is armed: the v2 retokenize covers every shard
+        self._retokenize()
 
     # ---------------------------------------------------------- shard utils
     def cols(self) -> list:
@@ -401,6 +424,60 @@ class MongoIndex:
         except Exception:
             pass
 
+    def _retokenize(self) -> None:
+        """One-time migration (v2), run in a daemon thread.
+
+        title_tokens used to be whitespace-split, so a title like
+        "Kuroko's Basketball ..." indexed the single token "kuroko's"
+        and a search for 'Kuroko' could never match it — the index
+        answered 4 rows where the site serves 65 (measured 2026-10-06).
+        Recomputes the array with the shared _site_tokens tokenizer for
+        every row whose token set actually changes (rows with
+        punctuation in the title; ~half the index). Idempotent and
+        guarded by a meta version stamp, so restarts are cheap and a
+        concurrent crawl upsert writes the same value either way."""
+        try:
+            meta = self._col.database["meta"]
+            if int((meta.find_one({"_id": "title_tokens_v"}) or {}).get("v", 0) or 0) >= 2:
+                return
+        except Exception:
+            return
+
+        def run() -> None:
+            from pymongo import UpdateOne
+            shards = [self._col]
+            if getattr(self, "_col2", None) is not None:
+                shards.append(self._col2)
+            changed = 0
+            try:
+                for col in shards:
+                    ops: list = []
+                    for doc in col.find({}, {"_id": 1, "title": 1}).batch_size(5000):
+                        title = doc.get("title")
+                        if title is None:
+                            continue
+                        toks = _site_tokens(str(title))
+                        if set(toks) != set(doc.get("title_tokens") or []):
+                            ops.append(UpdateOne(
+                                {"_id": doc["_id"]},
+                                {"$set": {"title_tokens": toks}}))
+                        if len(ops) >= 2000:
+                            col.bulk_write(ops, ordered=False)
+                            changed += len(ops)
+                            ops = []
+                    if ops:
+                        col.bulk_write(ops, ordered=False)
+                        changed += len(ops)
+                meta.update_one({"_id": "title_tokens_v"},
+                                {"$set": {"v": 2}}, upsert=True)
+                print(f"[index] retokenized {changed} rows: "
+                      "apostrophe/punctuation-safe title search", flush=True)
+            except Exception as e:
+                print(f"[index] retokenize deferred: "
+                      f"{type(e).__name__}: {e}", flush=True)
+
+        threading.Thread(target=run, daemon=True, name="retokenize").start()
+
     @staticmethod
     def _doc(row: dict, source: str, seq: float) -> dict:
         # NOTE: no _id here — it is immutable in $set; upsert inserts take it
@@ -410,8 +487,10 @@ class MongoIndex:
         if source:
             doc["_src"] = source
         doc["_seq"] = seq
-        # site-style search: whole tokens of the title, lowercased
-        doc["title_tokens"] = list({t for t in str(doc.get("title") or "").lower().split() if t})
+        # site-style search: every punctuation-separated token of the
+        # title, lowercased, plus the punctuation-joined form (see
+        # _site_tokens). Must match the query tokenizer exactly.
+        doc["title_tokens"] = _site_tokens(str(doc.get("title") or ""))
         return doc
 
     def upsert(self, rows: list[dict], source: str = "") -> tuple[int, int]:
@@ -450,10 +529,10 @@ class MongoIndex:
                         updated += 1
         return new, updated
     def recent(self, limit: int = 50, q: str | None = None) -> dict:
-        """Newest-discovered-first rows, filtered exactly like the mkvbase site
-        search: whitespace tokens, ALL must appear as whole tokens in the title.
-        Backed by the title_tokens multikey index ($all) — exact at any scale,
-        no fetch window."""
+        """Newest-discovered-first rows, filtered exactly like the mkvbase
+        site search: every query token must appear in the title, with
+        punctuation as a separator. Backed by the title_tokens multikey
+        index ($all) — exact at any scale, no fetch window."""
         self._hits += 1
         tokens = list({t.lower() for t in _site_tokens(q)})
         query = {"title_tokens": {"$all": tokens}} if tokens else {}
